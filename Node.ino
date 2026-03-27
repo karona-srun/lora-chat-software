@@ -17,7 +17,7 @@
 Preferences preferences;
 
 uint8_t MY_ADDH = 0x00;
-uint8_t MY_ADDL = 0x02;     // Default Node ID
+uint8_t MY_ADDL = 0x03;     // Default Node ID
 uint8_t TARGET_ADDH = 0x00;
 uint8_t TARGET_ADDL = 0x00; // Default Target
 uint8_t REPEATER_ADDH = 0xFF;
@@ -44,7 +44,7 @@ String defaultApSsid() {
 // Battery range: 3.3V (low) .. 4.2V (full)
 #define BAT_V_MIN     3.60   // battery "low" voltage
 #define BAT_V_MAX     4.20   // battery "full" voltage
-#define BAT_DIVIDER   (4.20 / 3.30)  // scale ADC to battery voltage if needed
+#define BAT_DIVIDER   (4.20 / 3.60)  // scale ADC to battery voltage if needed
 
 #define BTN_NEXT_PIN  32  // next screen button, pressed = LOW
 #define BTN_PREV_PIN  35  // previous screen button, pressed = LOW (input-only pin)
@@ -91,6 +91,9 @@ unsigned long popupUntilMs = 0;
 const bool AUTO_GPS_ENABLED = false;
 const unsigned long AUTO_GPS_INTERVAL_MS = 5000UL;
 const unsigned long BTN_NEXT_LONG_PRESS_MS = 3000UL;
+const unsigned long CHARGE_PIN_DEBOUNCE_MS = 400UL;
+const unsigned long UI_REFRESH_NORMAL_MS = 1000UL;
+const unsigned long UI_REFRESH_CHARGING_MS = 200UL;
 
 // ----------------------------- E22 pins --------------------------------------
 #define PIN_E22_TX   4
@@ -110,6 +113,12 @@ uint32_t receivedCount = 0;
 String lastSent = "";
 String lastReceived = "";
 int16_t lastRssiSignal = -255;
+uint16_t txMessageCounter = 0;
+String awaitingAckId = "";
+bool awaitingAckReceived = false;
+
+const unsigned long ACK_WAIT_MS = 1200UL;
+const uint8_t ACK_RETRY_MAX = 2;
 
 // Nearby nodes registry (learned from HELLO beacons)
 #define MAX_NEARBY_NODES 20
@@ -495,33 +504,64 @@ bool applyNodeConfig() {
 // Send Message
 // =============================================================================
 
-void sendMessage(String msg, bool viaRepeater = false, uint8_t destAddh = 0xFF, uint8_t destAddl = 0xFF, bool overrideDest = false) {
+static bool waitForAck(const String& msgId, unsigned long timeoutMs) {
+    awaitingAckId = msgId;
+    awaitingAckReceived = false;
+
+    unsigned long started = millis();
+    while ((millis() - started) < timeoutMs) {
+        checkIncoming();
+        if (awaitingAckReceived) {
+            awaitingAckId = "";
+            return true;
+        }
+        delay(10);
+    }
+
+    awaitingAckId = "";
+    return false;
+}
+
+bool sendMessage(String msg, bool viaRepeater = false, uint8_t destAddh = 0xFF, uint8_t destAddl = 0xFF, bool overrideDest = false) {
     uint8_t finalAddh = overrideDest ? destAddh : TARGET_ADDH;
     uint8_t finalAddl = overrideDest ? destAddl : TARGET_ADDL;
+    String myAddrHex = toHex4((MY_ADDH << 8) | MY_ADDL);
+    String msgId = toHex4(++txMessageCounter);
+    String payload = "MSG|" + msgId + "|" + myAddrHex + "|" + msg;
 
-    if (viaRepeater) {
-        // Send via repeater with relay header
-        String destHex = toHex4((finalAddh << 8) | finalAddl);
-        String relayMsg = "RELAY|" + destHex + "|" + msg;
-        
-        ResponseStatus rs = e22.sendFixedMessage(REPEATER_ADDH, REPEATER_ADDL, CHANNEL, relayMsg);
-        Serial.printf("[TX] Via repeater to 0x%02X%02X: %s\n", 
-            finalAddh, finalAddl, rs.getResponseDescription().c_str());
-        
-        addLogEntry("TX-RELAY", 0, toHex4((REPEATER_ADDH << 8) | REPEATER_ADDL), msg);
-    } else {
-        // Send direct
-        ResponseStatus rs = e22.sendFixedMessage(finalAddh, finalAddl, CHANNEL, msg);
-        Serial.printf("[TX] Direct to 0x%02X%02X: %s\n", 
-            finalAddh, finalAddl, rs.getResponseDescription().c_str());
-        
-        addLogEntry("TX", 0, toHex4((finalAddh << 8) | finalAddl), msg);
+    bool acked = false;
+    for (uint8_t attempt = 0; attempt <= ACK_RETRY_MAX; attempt++) {
+        if (viaRepeater) {
+            // Send via repeater with relay envelope.
+            String destHex = toHex4((finalAddh << 8) | finalAddl);
+            String relayMsg = "RELAY|" + destHex + "|" + payload;
+            ResponseStatus rs = e22.sendFixedMessage(REPEATER_ADDH, REPEATER_ADDL, CHANNEL, relayMsg);
+            Serial.printf("[TX] Via repeater to 0x%02X%02X (id=%s try=%u): %s\n",
+                finalAddh, finalAddl, msgId.c_str(), (unsigned)(attempt + 1), rs.getResponseDescription().c_str());
+            if (rs.code == 1 && waitForAck(msgId, ACK_WAIT_MS)) {
+                acked = true;
+                break;
+            }
+        } else {
+            ResponseStatus rs = e22.sendFixedMessage(finalAddh, finalAddl, CHANNEL, payload);
+            Serial.printf("[TX] Direct to 0x%02X%02X (id=%s try=%u): %s\n",
+                finalAddh, finalAddl, msgId.c_str(), (unsigned)(attempt + 1), rs.getResponseDescription().c_str());
+            if (rs.code == 1 && waitForAck(msgId, ACK_WAIT_MS)) {
+                acked = true;
+                break;
+            }
+        }
     }
-    
+
     sentCount++;
     lastSent = msg;
-    statusMsg = "SENT";
-    drawDisplay();
+    statusMsg = acked ? "SENT ACK" : "SENT NO ACK";
+    if (viaRepeater) {
+        addLogEntry(acked ? "TX-RELAY-ACK" : "TX-RELAY-NOACK", 0, toHex4((REPEATER_ADDH << 8) | REPEATER_ADDL), msg);
+    } else {
+        addLogEntry(acked ? "TX-ACK" : "TX-NOACK", 0, toHex4((finalAddh << 8) | finalAddl), msg);
+    }
+    return acked;
 }
 
 // =============================================================================
@@ -534,32 +574,71 @@ void checkIncoming() {
     ResponseContainer rc = e22.receiveMessageRSSI();
     if (rc.status.code != 1) return;
 
+    String payload = rc.data;
+
+    // ACK frame format: ACK|<msgId>
+    if (payload.startsWith("ACK|")) {
+        String ackId = payload.substring(4);
+        int sep = ackId.indexOf('|');
+        if (sep > 0) ackId = ackId.substring(0, sep);
+        ackId.trim();
+
+        if (awaitingAckId.length() > 0 && ackId == awaitingAckId) {
+            awaitingAckReceived = true;
+            statusMsg = "ACK RX";
+            Serial.printf("[ACK] Received for id=%s\n", ackId.c_str());
+        }
+        return;
+    }
+
+    // MSG frame format: MSG|<msgId>|<srcAddrHex>|<body>
+    if (payload.startsWith("MSG|")) {
+        int p1 = payload.indexOf('|');          // after MSG
+        int p2 = payload.indexOf('|', p1 + 1);  // after id
+        int p3 = payload.indexOf('|', p2 + 1);  // after src
+        if (p1 >= 0 && p2 > p1 && p3 > p2) {
+            String msgId = payload.substring(p1 + 1, p2);
+            String srcHex = payload.substring(p2 + 1, p3);
+            String body = payload.substring(p3 + 1);
+
+            int16_t srcAddr = parseHex16(srcHex);
+            if (srcAddr >= 0) {
+                uint8_t srcAddh = (uint8_t)((srcAddr >> 8) & 0xFF);
+                uint8_t srcAddl = (uint8_t)(srcAddr & 0xFF);
+                String ackPayload = "ACK|" + msgId;
+                e22.sendFixedMessage(srcAddh, srcAddl, CHANNEL, ackPayload);
+            }
+
+            payload = body;
+        }
+    }
+
     receivedCount++;
-    lastReceived = rc.data;
+    lastReceived = payload;
     lastRssiSignal = (int8_t)rc.rssi;
     statusMsg = "RX OK";
 
     // Learn nearby nodes via HELLO beacons:
     // Payload format: HELLO|AABB|NN|CC|R/N  or  HELLO|AABB|NN|CC|R/N|callSign
-    if (rc.data.startsWith("HELLO|")) {
-        int p1 = rc.data.indexOf('|');                 // after HELLO
-        int p2 = rc.data.indexOf('|', p1 + 1);         // after addr
-        int p3 = rc.data.indexOf('|', p2 + 1);         // after net
-        int p4 = rc.data.indexOf('|', p3 + 1);         // after chan
+    if (payload.startsWith("HELLO|")) {
+        int p1 = payload.indexOf('|');                 // after HELLO
+        int p2 = payload.indexOf('|', p1 + 1);         // after addr
+        int p3 = payload.indexOf('|', p2 + 1);         // after net
+        int p4 = payload.indexOf('|', p3 + 1);         // after chan
 
         if (p1 >= 0 && p2 > p1 && p3 > p2 && p4 > p3) {
-            String addrHex = rc.data.substring(p1 + 1, p2);
-            String netHex  = rc.data.substring(p2 + 1, p3);
-            String chHex   = rc.data.substring(p3 + 1, p4);
-            int p5 = rc.data.indexOf('|', p4 + 1);
+            String addrHex = payload.substring(p1 + 1, p2);
+            String netHex  = payload.substring(p2 + 1, p3);
+            String chHex   = payload.substring(p3 + 1, p4);
+            int p5 = payload.indexOf('|', p4 + 1);
             String role, csIn;
             if (p5 < 0) {
-                role = rc.data.substring(p4 + 1);
+                role = payload.substring(p4 + 1);
                 role.trim();
             } else {
-                role = rc.data.substring(p4 + 1, p5);
+                role = payload.substring(p4 + 1, p5);
                 role.trim();
-                csIn = rc.data.substring(p5 + 1);
+                csIn = payload.substring(p5 + 1);
                 csIn.trim();
             }
 
@@ -962,8 +1041,12 @@ void handleSend() {
             }
         }
 
-        sendMessage(msg, useRelay, destAddh, destAddl, overrideDest);
-        server.send(200, "text/plain", "OK");
+        bool acked = sendMessage(msg, useRelay, destAddh, destAddl, overrideDest);
+        if (acked) {
+            server.send(200, "text/plain", "OK (ACK)");
+        } else {
+            server.send(504, "text/plain", "Timeout waiting ACK");
+        }
     } else {
         server.send(400, "text/plain", "Missing msg parameter");
     }
@@ -1297,7 +1380,30 @@ int getBattPct() {
 void readBattery() {
   batteryVoltage = getBattV();
   batteryPercent = getBattPct();
-  batteryCharging = (digitalRead(BAT_CHARGING) == HIGH);
+
+  static bool rawChargeState = false;
+  static bool debouncedChargeState = false;
+  static unsigned long lastRawChangeMs = 0;
+
+  bool rawNow = (digitalRead(BAT_CHARGING) == HIGH);
+  unsigned long now = millis();
+
+  if (rawNow != rawChargeState) {
+    rawChargeState = rawNow;
+    lastRawChangeMs = now;
+  }
+
+  if ((now - lastRawChangeMs) >= CHARGE_PIN_DEBOUNCE_MS) {
+    debouncedChargeState = rawChargeState;
+  }
+
+  lastBatteryCharging = batteryCharging;
+  batteryCharging = debouncedChargeState;
+
+  // Re-enable charging screen automatically on a new charging event.
+  if (batteryCharging && !lastBatteryCharging) {
+    chargeScreenSuppressed = false;
+  }
 }
 
 String getBattery() {
@@ -1714,25 +1820,18 @@ void setup() {
 // =============================================================================
 
 void loop() {
-    static unsigned long lastDraw = 0;
+    static unsigned long lastUiRefresh = 0;
 
     server.handleClient();
 
     if (nodeReady) {
         checkIncoming();
-        drawCurrentScreen();
     }
 
     // Periodic discovery beacon to help UIs list nearby nodes
     if (nodeReady && (millis() - lastBeaconAt >= 5000)) {
         lastBeaconAt = millis();
         sendHelloBeacon();
-    }
-
-    if (millis() - lastDraw >= 1000) {
-        lastDraw = millis();
-        // drawDisplay();
-        drawCurrentScreen();
     }
 
     // Buttons
@@ -1775,16 +1874,16 @@ void loop() {
   }
 
   static unsigned long lastBatteryRead = 0;
-  if (millis() - lastBatteryRead >= 10000UL) {
+  if (millis() - lastBatteryRead >= 2000UL) {
     lastBatteryRead = millis();
     readBattery();
     if (popupType == PopupType::None) drawCurrentScreen();
   }
 
-  static unsigned long lastChargeAnimMs = 0;
   bool chargeScreenVisible = (batteryCharging && !chargeScreenSuppressed);
-  if (popupType == PopupType::None && chargeScreenVisible && millis() - lastChargeAnimMs >= 120UL) {
-    lastChargeAnimMs = millis();
-    drawChargingScreen();
+  unsigned long uiRefreshPeriod = chargeScreenVisible ? UI_REFRESH_CHARGING_MS : UI_REFRESH_NORMAL_MS;
+  if (popupType == PopupType::None && millis() - lastUiRefresh >= uiRefreshPeriod) {
+    lastUiRefresh = millis();
+    drawCurrentScreen();
   }
 }
