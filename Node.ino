@@ -17,7 +17,7 @@
 Preferences preferences;
 
 uint8_t MY_ADDH = 0x00;
-uint8_t MY_ADDL = 0x03;     // Default Node ID
+uint8_t MY_ADDL = 0x01;     // Default Node ID
 uint8_t TARGET_ADDH = 0x00;
 uint8_t TARGET_ADDL = 0x00; // Default Target
 uint8_t REPEATER_ADDH = 0xFF;
@@ -1820,21 +1820,21 @@ void setup() {
 // =============================================================================
 
 void loop() {
-    static unsigned long lastUiRefresh = 0;
+  static unsigned long lastUiRefresh = 0;
 
-    server.handleClient();
+  server.handleClient();
 
-    if (nodeReady) {
-        checkIncoming();
-    }
+  if (nodeReady) {
+      checkIncoming();
+  }
 
-    // Periodic discovery beacon to help UIs list nearby nodes
-    if (nodeReady && (millis() - lastBeaconAt >= 5000)) {
-        lastBeaconAt = millis();
-        sendHelloBeacon();
-    }
+  // Periodic discovery beacon to help UIs list nearby nodes
+  if (nodeReady && (millis() - lastBeaconAt >= 5000)) {
+      lastBeaconAt = millis();
+      sendHelloBeacon();
+  }
 
-    // Buttons
+  // Buttons
   if (digitalRead(BTN_PREV_PIN) == LOW && (millis() - lastPrevBtnPress) > 300) {
     lastPrevBtnPress = millis();
     currentScreen = (currentScreen + 2) % 3;
