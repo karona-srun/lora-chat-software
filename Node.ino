@@ -12,12 +12,13 @@
 #include <WebServer.h>
 #include <Preferences.h>
 #include <TinyGPSPlus.h>
+#include <math.h>
 
 // ----------------------------- Dynamic Configuration -------------------------
 Preferences preferences;
 
 uint8_t MY_ADDH = 0x00;
-uint8_t MY_ADDL = 0x01;     // Default Node ID
+uint8_t MY_ADDL = 0x03;     // Default Node ID
 uint8_t TARGET_ADDH = 0x00;
 uint8_t TARGET_ADDL = 0x00; // Default Target
 uint8_t REPEATER_ADDH = 0xFF;
@@ -26,6 +27,8 @@ uint8_t NETWORK_ID = 0x01;  // Default Network ID
 uint8_t CHANNEL = 0x41;     // Default Channel 915Mhz
 uint16_t CRYPT = 0x8002;    // KEY 32770
 bool USE_REPEATER = false;  // Repeater mode
+// E22 TX power: 0=POWER_22, 1=POWER_17, 2=POWER_13, 3=POWER_10 (see LoRa_E22 Option.transmissionPower)
+uint8_t E22_TX_POWER = 0;
 
 // ----------------------------- WiFi credentials -------------------------------
 String ssid_AP = "LM-" + String(MY_ADDL);
@@ -92,8 +95,8 @@ const bool AUTO_GPS_ENABLED = false;
 const unsigned long AUTO_GPS_INTERVAL_MS = 5000UL;
 const unsigned long BTN_NEXT_LONG_PRESS_MS = 3000UL;
 const unsigned long CHARGE_PIN_DEBOUNCE_MS = 400UL;
-const unsigned long UI_REFRESH_NORMAL_MS = 1000UL;
-const unsigned long UI_REFRESH_CHARGING_MS = 200UL;
+const unsigned long UI_REFRESH_NORMAL_MS = 5000UL;
+const unsigned long UI_REFRESH_CHARGING_MS = 1000UL;
 
 // ----------------------------- E22 pins --------------------------------------
 #define PIN_E22_TX   4
@@ -130,6 +133,9 @@ struct NearbyNode {
     unsigned long lastSeen;
     bool isRepeater;
     String callSign;
+    bool hasGpsFix;
+    double lat;
+    double lng;
 };
 NearbyNode nearbyNodes[MAX_NEARBY_NODES];
 uint8_t nearbyCount = 0;
@@ -202,6 +208,8 @@ void loadConfig() {
     }
     ssid_AP = preferences.getString("ssid_ap", defaultApSsid());
     if (ssid_AP.length() == 0) ssid_AP = defaultApSsid();
+    E22_TX_POWER = preferences.getUChar("tx_power", E22_TX_POWER);
+    if (E22_TX_POWER > 3) E22_TX_POWER = 0;
     
     preferences.end();
     
@@ -213,6 +221,7 @@ void loadConfig() {
     Serial.printf("Channel: 0x%02X\n", CHANNEL);
     Serial.printf("Use Repeater: %s\n", USE_REPEATER ? "Yes" : "No");
     Serial.printf("CRYPT: 0x%04X (must match other nodes; 0x0000 = off)\n", CRYPT);
+    Serial.printf("E22 TX power index: %u (0=max ~22dBm .. 3=min ~10dBm)\n", (unsigned)E22_TX_POWER);
     Serial.println("============================\n");
 }
 
@@ -229,6 +238,7 @@ void saveConfig() {
     preferences.putUChar("channel", CHANNEL);
     preferences.putBool("use_repeater", USE_REPEATER);
     preferences.putUShort("crypt", CRYPT);
+    preferences.putUChar("tx_power", E22_TX_POWER);
     
     preferences.end();
     
@@ -339,7 +349,7 @@ static String defaultCallSignForAddr(uint16_t addr) {
 }
 
 void upsertNearbyNode(uint16_t addr, uint8_t netId, uint8_t channel, int16_t rssi, bool isRepeater,
-                      const String &callSignIn) {
+                      const String &callSignIn, bool hasGpsFixIn = false, double latIn = 0.0, double lngIn = 0.0) {
     if (addr == 0x0000) return;
     unsigned long now = millis();
     for (uint8_t i = 0; i < nearbyCount; i++) {
@@ -350,6 +360,11 @@ void upsertNearbyNode(uint16_t addr, uint8_t netId, uint8_t channel, int16_t rss
             nearbyNodes[i].lastSeen = now;
             nearbyNodes[i].isRepeater = isRepeater;
             if (callSignIn.length() > 0) nearbyNodes[i].callSign = callSignIn;
+            if (hasGpsFixIn) {
+                nearbyNodes[i].hasGpsFix = true;
+                nearbyNodes[i].lat = latIn;
+                nearbyNodes[i].lng = lngIn;
+            }
             return;
         }
     }
@@ -361,6 +376,9 @@ void upsertNearbyNode(uint16_t addr, uint8_t netId, uint8_t channel, int16_t rss
         nearbyNodes[nearbyCount].lastSeen = now;
         nearbyNodes[nearbyCount].isRepeater = isRepeater;
         nearbyNodes[nearbyCount].callSign = callSignIn.length() > 0 ? callSignIn : defaultCallSignForAddr(addr);
+        nearbyNodes[nearbyCount].hasGpsFix = hasGpsFixIn;
+        nearbyNodes[nearbyCount].lat = latIn;
+        nearbyNodes[nearbyCount].lng = lngIn;
         nearbyCount++;
         return;
     }
@@ -378,6 +396,24 @@ void upsertNearbyNode(uint16_t addr, uint8_t netId, uint8_t channel, int16_t rss
     nearbyNodes[oldestIdx].isRepeater = isRepeater;
     nearbyNodes[oldestIdx].callSign =
         callSignIn.length() > 0 ? callSignIn : defaultCallSignForAddr(addr);
+    nearbyNodes[oldestIdx].hasGpsFix = hasGpsFixIn;
+    nearbyNodes[oldestIdx].lat = latIn;
+    nearbyNodes[oldestIdx].lng = lngIn;
+}
+
+static double deg2rad(double deg) { return deg * (PI / 180.0); }
+
+static double haversineMeters(double lat1, double lon1, double lat2, double lon2) {
+    // Earth radius mean (meters)
+    const double R = 6371000.0;
+    const double dLat = deg2rad(lat2 - lat1);
+    const double dLon = deg2rad(lon2 - lon1);
+    const double a =
+        sin(dLat / 2.0) * sin(dLat / 2.0) +
+        cos(deg2rad(lat1)) * cos(deg2rad(lat2)) *
+        sin(dLon / 2.0) * sin(dLon / 2.0);
+    const double c = 2.0 * atan2(sqrt(a), sqrt(1.0 - a));
+    return R * c;
 }
 
 // =============================================================================
@@ -478,7 +514,7 @@ bool applyNodeConfig() {
 
     config.OPTION.subPacketSetting  = SPS_240_00;
     config.OPTION.RSSIAmbientNoise  = RSSI_AMBIENT_NOISE_DISABLED;
-    config.OPTION.transmissionPower = POWER_22; // MAX POWER
+    config.OPTION.transmissionPower = E22_TX_POWER & 0x03;
 
     config.TRANSMISSION_MODE.enableRSSI            = RSSI_ENABLED;
     config.TRANSMISSION_MODE.fixedTransmission     = FT_FIXED_TRANSMISSION;
@@ -630,16 +666,45 @@ void checkIncoming() {
             String addrHex = payload.substring(p1 + 1, p2);
             String netHex  = payload.substring(p2 + 1, p3);
             String chHex   = payload.substring(p3 + 1, p4);
-            int p5 = payload.indexOf('|', p4 + 1);
+            // Optional fields:
+            // HELLO|AABB|NN|CC|R/N
+            // HELLO|AABB|NN|CC|R/N|callSign
+            // HELLO|AABB|NN|CC|R/N|callSign|lat|lng
+            int p5 = payload.indexOf('|', p4 + 1);      // after role
             String role, csIn;
+            bool hasFix = false;
+            double latIn = 0.0, lngIn = 0.0;
+
             if (p5 < 0) {
                 role = payload.substring(p4 + 1);
                 role.trim();
             } else {
                 role = payload.substring(p4 + 1, p5);
                 role.trim();
-                csIn = payload.substring(p5 + 1);
-                csIn.trim();
+
+                int p6 = payload.indexOf('|', p5 + 1);  // after callSign
+                if (p6 < 0) {
+                    csIn = payload.substring(p5 + 1);
+                    csIn.trim();
+                } else {
+                    csIn = payload.substring(p5 + 1, p6);
+                    csIn.trim();
+
+                    int p7 = payload.indexOf('|', p6 + 1); // after lat
+                    if (p7 > p6) {
+                        String latS = payload.substring(p6 + 1, p7);
+                        String lngS = payload.substring(p7 + 1);
+                        latS.trim();
+                        lngS.trim();
+                        if (latS.length() > 0 && lngS.length() > 0) {
+                            latIn = latS.toDouble();
+                            lngIn = lngS.toDouble();
+                            if (latIn >= -90.0 && latIn <= 90.0 && lngIn >= -180.0 && lngIn <= 180.0) {
+                                hasFix = true;
+                            }
+                        }
+                    }
+                }
             }
 
             int16_t addrVal = parseHex16(addrHex);
@@ -648,7 +713,7 @@ void checkIncoming() {
             bool isRep = (role.length() > 0 && role.charAt(0) == 'R');
             if (addrVal >= 0 && netVal >= 0 && chVal >= 0) {
                 upsertNearbyNode((uint16_t)addrVal, (uint8_t)netVal, (uint8_t)chVal, (int8_t)rc.rssi, isRep,
-                                 csIn);
+                                 csIn, hasFix, latIn, lngIn);
             }
         }
     }
@@ -822,7 +887,7 @@ void handleRoot() {
 <body>
   <div class="container">
     <h1>📡 LoRa Node - Dynamic Configuration</h1>
-    <p style="margin:-8px 0 16px 0"><a href="/setup" style="color:#0af">WiFi setup</a> · <a href="/status" style="color:#0af">Device &amp; E22 status</a> · <a href="/api/status" style="color:#888">JSON</a></p>
+    <p style="margin:-8px 0 16px 0"><a href="/setup" style="color:#0af">WiFi setup</a> · <a href="/setPower" style="color:#0af">E22 TX power</a> · <a href="/status" style="color:#0af">Device &amp; E22 status</a> · <a href="/api/status" style="color:#888">JSON</a></p>
     
     <div class="card">
       <h2>Current Status</h2>
@@ -1012,6 +1077,78 @@ void handleSetupSave() {
     ESP.restart();
 }
 
+void handleSetPowerPage() {
+    String html;
+    html.reserve(2800);
+    html += F("<!DOCTYPE html><html><head><meta charset=\"utf-8\">");
+    html += F("<meta name=\"viewport\" content=\"width=device-width,initial-scale=1\">");
+    html += F("<title>E22 TX Power</title>");
+    html += F("<style>");
+    html += F("body{font-family:Arial,sans-serif;margin:0;padding:20px;background:#1a1a2e;color:#eee;}");
+    html += F(".card{background:#16213e;padding:20px;border-radius:8px;max-width:680px;margin:0 auto;box-shadow:0 4px 8px rgba(0,0,0,0.3);}");
+    html += F("h1{color:#0af;margin-top:0;}label{display:block;margin:10px 0 6px;color:#aaa;}");
+    html += F("select{width:100%;padding:10px;background:#0f3460;color:#fff;border:1px solid #0af;border-radius:5px;font-size:15px;box-sizing:border-box;}");
+    html += F("button{background:#0f3;color:#000;border:none;padding:12px 20px;border-radius:5px;cursor:pointer;font-size:15px;font-weight:bold;margin-top:14px;}");
+    html += F("button:hover{background:#0c2;}a{color:#0af;}");
+    html += F(".muted{color:#888;font-size:13px;}.ok{margin-top:12px;padding:10px;background:#0a3;color:#afa;border-radius:5px;}");
+    html += F("</style></head><body><div class=\"card\">");
+    html += F("<p><a href=\"/\">&larr; Back to control panel</a></p>");
+    html += F("<h1>E22 transmission power</h1>");
+    html += F("<p class=\"muted\">Applies the same register as <code>OPTION.transmissionPower</code> (E22-900 series: ~22 / 17 / 13 / 10 dBm).</p>");
+    if (server.hasArg("ok")) {
+        html += F("<p class=\"ok\">Saved and applied to the radio (no restart).</p>");
+    }
+    html += F("<form method=\"POST\" action=\"/setPower/save\">");
+    html += F("<label for=\"power\">Output power</label>");
+    html += F("<select id=\"power\" name=\"power\" required>");
+    const char *opts[] = {"22 dBm (max)", "17 dBm", "13 dBm", "10 dBm (min)"};
+    for (uint8_t i = 0; i < 4; i++) {
+        html += F("<option value=\"");
+        html += String(i);
+        html += F("\"");
+        if (E22_TX_POWER == i) html += F(" selected");
+        html += F(">");
+        html += opts[i];
+        html += F("</option>");
+    }
+    html += F("</select>");
+    html += F("<button type=\"submit\">Save &amp; apply to E22</button>");
+    html += F("</form>");
+    html += F("<p class=\"muted\">Current stored index: ");
+    html += String(E22_TX_POWER);
+    html += F(" · <a href=\"/status\">Verify on status page</a></p>");
+    html += F("</div></body></html>");
+    server.send(200, "text/html", html);
+}
+
+void handleSetPowerSave() {
+    if (!server.hasArg("power")) {
+        server.send(400, "text/plain", "Missing power");
+        return;
+    }
+    int p = server.arg("power").toInt();
+    if (p < 0 || p > 3) {
+        server.send(400, "text/plain", "Invalid power (0..3)");
+        return;
+    }
+    E22_TX_POWER = (uint8_t)p;
+    saveConfig();
+    if (!applyNodeConfig()) {
+        server.send(500, "text/html",
+                     "<!DOCTYPE html><html><head><meta charset=\"utf-8\"><title>TX power</title></head>"
+                     "<body style=\"font-family:sans-serif;background:#1a1a2e;color:#eee;padding:20px;\">"
+                     "<p>Failed to write configuration to E22. Check wiring / AUX.</p>"
+                     "<p><a style=\"color:#0af\" href=\"/setPower\">Back</a></p></body></html>");
+        return;
+    }
+    server.sendHeader("Location", "/setPower?ok=1");
+    server.send(303, "text/plain", "");
+
+    server.send(200, "text/plain", "Saved and restarting...");
+    delay(1000);
+    ESP.restart();
+}
+
 void handleSend() {
     if (server.hasArg("msg")) {
         String msg = server.arg("msg");
@@ -1130,9 +1267,11 @@ void handleStatusPage() {
         html += F("<tr><th>RSSI ambient noise (enum)</th><td>");
         html += String((uint8_t)cfg.OPTION.RSSIAmbientNoise);
         html += F("</td></tr>");
-        html += F("<tr><th>TX power (enum)</th><td>");
+        html += F("<tr><th>TX power</th><td>");
+        html += cfg.OPTION.getTransmissionPowerDescription();
+        html += F(" (enum ");
         html += String((uint8_t)cfg.OPTION.transmissionPower);
-        html += F("</td></tr>");
+        html += F(")</td></tr>");
         html += F("<tr><th>RSSI on wire (enum)</th><td>");
         html += String((uint8_t)cfg.TRANSMISSION_MODE.enableRSSI);
         html += F("</td></tr>");
@@ -1220,7 +1359,8 @@ void handleAPIStatus() {
     json += "\"netId\":\"" + toHex2(NETWORK_ID) + "\",";
     json += "\"channel\":\"" + toHex2(CHANNEL) + "\",";
     json += "\"crypt\":\"" + toHex4(CRYPT) + "\",";
-    json += "\"useRepeater\":" + String(USE_REPEATER ? "true" : "false");
+    json += "\"useRepeater\":" + String(USE_REPEATER ? "true" : "false") + ",";
+    json += "\"txPower\":" + String(E22_TX_POWER);
     json += "},";
 
     // Traffic counters and last payloads.
@@ -1289,6 +1429,9 @@ void handleAPILog() {
 void handleAPINodes() {
     String json = "[";
     unsigned long now = millis();
+    const bool myFix = gps.location.isValid();
+    const double myLat = myFix ? gps.location.lat() : 0.0;
+    const double myLng = myFix ? gps.location.lng() : 0.0;
     for (uint8_t i = 0; i < nearbyCount; i++) {
         if (json.length() > 1) json += ",";
         bool online = isNearbyNodeOnlineAt(i, now);
@@ -1301,6 +1444,19 @@ void handleAPINodes() {
         json += "\"repeater\":" + String(nearbyNodes[i].isRepeater ? "true" : "false") + ",";
         json += "\"online\":" + String(online ? "true" : "false") + ",";
         json += "\"callSign\":\"" + jsonEscape(nearbyNodes[i].callSign) + "\",";
+        json += "\"gpsFix\":" + String(nearbyNodes[i].hasGpsFix ? "true" : "false") + ",";
+        if (nearbyNodes[i].hasGpsFix) {
+            json += "\"lat\":" + String(nearbyNodes[i].lat, 6) + ",";
+            json += "\"lng\":" + String(nearbyNodes[i].lng, 6) + ",";
+        }
+        if (myFix && nearbyNodes[i].hasGpsFix) {
+            double dm = haversineMeters(myLat, myLng, nearbyNodes[i].lat, nearbyNodes[i].lng);
+            json += "\"distanceM\":" + String(dm, 1) + ",";
+            json += "\"distanceKm\":" + String(dm / 1000.0, 3) + ",";
+        } else {
+            json += "\"distanceM\":0,";
+            json += "\"distanceKm\":0,";
+        }
         if (CRYPT != 0x0000) {
             json += "\"crypt\":\"enabled\"";
         } else {
@@ -1309,12 +1465,18 @@ void handleAPINodes() {
         json += "}";
     }
     json += "]";
-    json = "{\"onlineCount\":" + String(countOnlineNearbyNodes(now)) + ",\"nodes\":" + json + "}";
+    json = "{\"onlineCount\":" + String(countOnlineNearbyNodes(now)) +
+           ",\"myGpsFix\":" + String(myFix ? "true" : "false") +
+           ",\"myLat\":" + (myFix ? String(myLat, 6) : String("null")) +
+           ",\"myLng\":" + (myFix ? String(myLng, 6) : String("null")) +
+           ",\"nodes\":" + json + "}";
     server.send(200, "application/json", json);
 }
 
 void sendHelloBeacon() {
-    // Beacon format: HELLO|AABB|NN|CC|R/N|callSign  (pipe not allowed in callSign)
+    // Beacon format (backward compatible):
+    // HELLO|AABB|NN|CC|R/N|callSign
+    // HELLO|AABB|NN|CC|R/N|callSign|lat|lng   (if GPS fix)
     String payload = "HELLO|";
     payload += toHex4((MY_ADDH << 8) | MY_ADDL);
     payload += "|";
@@ -1328,6 +1490,13 @@ void sendHelloBeacon() {
         cs.replace("|", "");
         payload += "|";
         payload += cs;
+    }
+
+    if (gps.location.isValid()) {
+        payload += "|";
+        payload += String(gps.location.lat(), 6);
+        payload += "|";
+        payload += String(gps.location.lng(), 6);
     }
 
     // Best-effort broadcast (0xFFFF). Doesn't affect counters/log.
@@ -1497,6 +1666,24 @@ void drawHeader() {
 // ────────────────────────────────────────────────
 // OLED drawing - Meshtastic-style layout
 // ────────────────────────────────────────────────
+
+// Bottom page indicator: 3 screens — small dots for others, larger dot for current.
+static void drawScreenPageDots() {
+  const int n = 3;
+  const int cy = 61;
+  const int spacing = 14;
+  const int totalW = (n - 1) * spacing;
+  const int startX = (SCREEN_WIDTH - totalW) / 2;
+  for (int i = 0; i < n; i++) {
+    const int cx = startX + i * spacing;
+    if (i == currentScreen) {
+      display.fillCircle(cx, cy, 1  , SSD1306_WHITE);
+    } else {
+      display.fillCircle(cx, cy, 0, SSD1306_WHITE);
+    }
+  }
+}
+
 // Screen 1: Status screen
 // ────────────────────────────────────────────────
 void drawStatusScreen() {
@@ -1556,17 +1743,18 @@ void drawStatusScreen() {
   display.setTextSize(1);
   display.print(" (DBR)");
   
-  // Bottom progress bar (width = SCREEN_WIDTH/2, centered)
-  int progress = 0;
-  int progBarWidth = SCREEN_WIDTH / 2;  // 64
-  int progBarX = (SCREEN_WIDTH - progBarWidth) / 2;  // centered
-  int progBarY = SCREEN_HEIGHT - 4;  // near bottom
-  display.drawRect(progBarX, progBarY, progBarWidth, 2, SSD1306_WHITE);
-  if (progress > 0) {
-    int fillWidth = (progress * (progBarWidth - 2)) / 100;
-    display.fillRect(progBarX + 1, progBarY + 1, fillWidth, 1, SSD1306_WHITE);
-  }
-  
+  // Bottom progress bar (width = SCREEN_WIDTH/2, centered) — above page dots
+  // int progress = 0;
+  // int progBarWidth = SCREEN_WIDTH / 2;  // 64
+  // int progBarX = (SCREEN_WIDTH - progBarWidth) / 2;  // centered
+  // int progBarY = 57;  // above page dots (cy=61); below callsign row (y=49)
+  // display.drawRect(progBarX, progBarY, progBarWidth, 2, SSD1306_WHITE);
+  // if (progress > 0) {
+  //   int fillWidth = (progress * (progBarWidth - 2)) / 100;
+  //   display.fillRect(progBarX + 1, progBarY + 1, fillWidth, 1, SSD1306_WHITE);
+  // }
+
+  drawScreenPageDots();
   display.display();
 }
 
@@ -1580,24 +1768,101 @@ void drawWifiScreen() {
   display.setTextSize(1);
   display.setTextColor(SSD1306_WHITE);
   
-  display.setCursor(4, 18);
+  // Row 1: Wi-Fi SSID with signal icon
+  // Simple 3-bar Wi-Fi symbol on the left
+  const int wifiIconX = 4;
+  const int wifiIconY = 18;
+  display.drawLine(wifiIconX,     wifiIconY + 6, wifiIconX + 3, wifiIconY + 3, SSD1306_WHITE);
+  display.drawLine(wifiIconX + 3, wifiIconY + 3, wifiIconX + 6, wifiIconY + 6, SSD1306_WHITE);
+  display.drawPixel(wifiIconX + 3, wifiIconY + 7, SSD1306_WHITE);
+  // Text shifted right to make room for icon
+  display.setCursor(16, 18);
   display.print("SSID:");
   display.print(ssid_AP);
   
-  display.setCursor(4, 30);
+  // Row 2: Password with key icon
+  const int keyX = 4;
+  const int keyY = 30;
+  display.drawCircle(keyX + 2, keyY + 2, 2, SSD1306_WHITE);              // key head
+  display.drawLine(keyX + 4, keyY + 2, keyX + 8, keyY + 2, SSD1306_WHITE); // shaft
+  display.drawPixel(keyX + 8, keyY + 1, SSD1306_WHITE);                  // tooth
+  display.drawPixel(keyX + 8, keyY + 3, SSD1306_WHITE);                  // tooth
+  display.setCursor(16, 30);
   display.print("PASS:");
   display.print(password_AP);
   
-  display.setCursor(4, 42);
+  // Row 3: IP address with small screen/monitor icon
+  const int ipIconX = 4;
+  const int ipIconY = 42;
+  display.drawRect(ipIconX, ipIconY, 9, 6, SSD1306_WHITE);  // screen
+  display.drawFastHLine(ipIconX + 2, ipIconY + 7, 5, SSD1306_WHITE); // base
+  display.setCursor(16, 42);
   display.print("IP: ");
   display.print(WiFi.softAPIP().toString());
-  
+
+  drawScreenPageDots();
   display.display();
 }
 
 // ────────────────────────────────────────────────
 // Screen 3: GPS info
 // ────────────────────────────────────────────────
+static void drawNavigationCompass(double bearingDeg, bool bearingValid) {
+  // Small “navigation compass” on the right side.
+  // Note: SSD1306 coordinates use +Y downward; we want 0deg (north) to point up.
+  const int cx = 118;
+  const int cy = 34;
+  const int r = 9;
+
+  display.drawCircle(cx, cy, r, SSD1306_WHITE);
+  display.drawPixel(cx, cy, SSD1306_WHITE);
+
+  // Compass arrow
+  if (bearingValid) {
+    // Normalize to [0, 360)
+    while (bearingDeg < 0) bearingDeg += 360.0;
+    while (bearingDeg >= 360.0) bearingDeg -= 360.0;
+
+    const double rad = deg2rad(bearingDeg);
+    const int tipX = cx + (int)(sin(rad) * r);
+    const int tipY = cy - (int)(cos(rad) * r);
+    const int tipXc = constrain(tipX, 0, SCREEN_WIDTH - 1);
+    const int tipYc = constrain(tipY, 0, SCREEN_HEIGHT - 1);
+
+    display.drawLine(cx, cy, tipXc, tipYc, SSD1306_WHITE);
+
+    // Simple arrow head
+    const double headHalfAngle = deg2rad(20.0);
+    const int headLen = 4;
+    const double a1 = rad + PI + headHalfAngle;
+    const double a2 = rad + PI - headHalfAngle;
+
+    const int x1 = tipXc + (int)(sin(a1) * headLen);
+    const int y1 = tipYc - (int)(cos(a1) * headLen);
+    const int x2 = tipXc + (int)(sin(a2) * headLen);
+    const int y2 = tipYc - (int)(cos(a2) * headLen);
+    const int x1c = constrain(x1, 0, SCREEN_WIDTH - 1);
+    const int y1c = constrain(y1, 0, SCREEN_HEIGHT - 1);
+    const int x2c = constrain(x2, 0, SCREEN_WIDTH - 1);
+    const int y2c = constrain(y2, 0, SCREEN_HEIGHT - 1);
+
+    display.drawLine(tipXc, tipYc, x1c, y1c, SSD1306_WHITE);
+    display.drawLine(tipXc, tipYc, x2c, y2c, SSD1306_WHITE);
+
+    // Cardinal letter + bearing degrees
+    const char dirLetters[] = {'N', 'E', 'S', 'W'};
+    const int dirIdx = ((int)((bearingDeg + 45.0) / 90.0)) % 4;
+    display.setCursor(88, 54);
+    display.print(dirLetters[dirIdx]);
+    display.print(':');
+    display.print((int)bearingDeg);
+  } else {
+    // No course: draw an X inside the compass.
+    display.drawLine(cx - r, cy - r, cx + r, cy + r, SSD1306_WHITE);
+    display.drawLine(cx + r, cy - r, cx - r, cy + r, SSD1306_WHITE);
+  }
+}
+
 void drawGpsScreen() {
   getGPSMessage();
   display.clearDisplay();
@@ -1609,9 +1874,11 @@ void drawGpsScreen() {
   display.setCursor(4, 16);
   display.print("Sats: ");
   display.print(gps.satellites.value());
-  display.setCursor(60, 16);
-  display.print("Up: ");
-  display.print(getUptime());
+
+  // Right side navigation compass (uses GPS course/track angle).
+  const bool courseValid = gps.course.isValid();
+  const double courseDeg = courseValid ? gps.course.deg() : 0.0;
+  drawNavigationCompass(courseDeg, courseValid);
   
   if (gps.location.isValid()) {
     display.setCursor(4, 26);
@@ -1633,6 +1900,18 @@ void drawGpsScreen() {
     display.print("Sats: ");
     display.print(gps.satellites.value());
   }
+
+  // Short uptime at bottom-left to avoid overlapping the right compass.
+  unsigned long seconds = (millis() - startTime) / 1000;
+  unsigned long hours = seconds / 3600;
+  unsigned long minutes = (seconds % 3600) / 60;
+  char upBuf[16];
+  snprintf(upBuf, sizeof(upBuf), "%luh%lum", hours, minutes);
+  display.setCursor(4, 52);
+  display.print("Up:");
+  display.print(upBuf);
+
+  drawScreenPageDots();
   Serial.println("----------------------------");
   Serial.print("GPS Satellites -> ");
   Serial.println(gps.satellites.value());
@@ -1750,6 +2029,7 @@ void setup() {
     startTime = millis();
     // Clear cache
     // ClearConfig();
+    delay(1000);
 
     // Load saved configuration
     loadConfig();
@@ -1770,6 +2050,8 @@ void setup() {
     server.on("/", handleRoot);
     server.on("/setup", HTTP_GET, handleSetupPage);
     server.on("/setup/save", HTTP_POST, handleSetupSave);
+    server.on("/setPower", HTTP_GET, handleSetPowerPage);
+    server.on("/setPower/save", HTTP_POST, handleSetPowerSave);
     server.on("/send", handleSend);
     server.on("/config", handleConfig);
     server.on("/status", handleStatusPage);
@@ -1824,6 +2106,11 @@ void loop() {
 
   server.handleClient();
 
+  // Update GPS early so beacons/API have freshest fix.
+  while (gpsSerial.available() > 0) {
+    gps.encode(gpsSerial.read());
+  }
+
   if (nodeReady) {
       checkIncoming();
   }
@@ -1861,11 +2148,6 @@ void loop() {
       drawCurrentScreen();
     }
     nextBtnHeld = false;
-  }
-
-  // Update GPS
-  while (gpsSerial.available() > 0) {
-    gps.encode(gpsSerial.read());
   }
 
   if (popupType != PopupType::None && (long)(millis() - popupUntilMs) >= 0) {
