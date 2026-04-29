@@ -18,7 +18,7 @@
 Preferences preferences;
 
 uint8_t MY_ADDH = 0x00;
-uint8_t MY_ADDL = 0x03;     // Default Node ID
+uint8_t MY_ADDL = 0x02;     // Default Node ID
 uint8_t TARGET_ADDH = 0x00;
 uint8_t TARGET_ADDL = 0x00; // Default Target
 uint8_t REPEATER_ADDH = 0xFF;
@@ -44,6 +44,7 @@ String defaultApSsid() {
 
 // Battery ADC: 0–4095 @ 3.3V; adjust divider so 4.2V battery → ~3.3V at pin
 #define BAT_ADC_MAX   4095.0
+
 // Battery range: 3.3V (low) .. 4.2V (full)
 #define BAT_V_MIN     3.60   // battery "low" voltage
 #define BAT_V_MAX     4.20   // battery "full" voltage
@@ -266,6 +267,59 @@ String toHex4(uint16_t addr) {
     char b[5];
     snprintf(b, sizeof(b), "%04X", addr);
     return String(b);
+}
+
+static String radioEscapeField(const String &s) {
+    String out;
+    out.reserve(s.length() * 3);
+    const char *hex = "0123456789ABCDEF";
+    for (size_t i = 0; i < s.length(); i++) {
+        unsigned char c = (unsigned char)s.charAt(i);
+        if ((c >= 'A' && c <= 'Z') || (c >= 'a' && c <= 'z') ||
+            (c >= '0' && c <= '9') || c == '-' || c == '_' || c == '.' || c == '~') {
+            out += (char)c;
+        } else {
+            out += '%';
+            out += hex[(c >> 4) & 0x0F];
+            out += hex[c & 0x0F];
+        }
+    }
+    return out;
+}
+
+static int8_t hexNibble(char c) {
+    if (c >= '0' && c <= '9') return c - '0';
+    if (c >= 'A' && c <= 'F') return c - 'A' + 10;
+    if (c >= 'a' && c <= 'f') return c - 'a' + 10;
+    return -1;
+}
+
+static String radioUnescapeField(const String &s) {
+    String out;
+    out.reserve(s.length());
+    for (size_t i = 0; i < s.length(); i++) {
+        char c = s.charAt(i);
+        if (c == '%' && (i + 2) < s.length()) {
+            int8_t hi = hexNibble(s.charAt(i + 1));
+            int8_t lo = hexNibble(s.charAt(i + 2));
+            if (hi >= 0 && lo >= 0) {
+                out += (char)((hi << 4) | lo);
+                i += 2;
+                continue;
+            }
+        }
+        out += c;
+    }
+    return out;
+}
+
+static String formatStructuredMessage(const String &fromContactId, const String &toContactId, const String &messageBody) {
+    String out = fromContactId;
+    out += "|";
+    out += toContactId;
+    out += "|";
+    out += messageBody;
+    return out;
 }
 
 int16_t parseHex16(const String &hex4) {
@@ -562,8 +616,10 @@ bool sendMessage(String msg, bool viaRepeater = false, uint8_t destAddh = 0xFF, 
     uint8_t finalAddh = overrideDest ? destAddh : TARGET_ADDH;
     uint8_t finalAddl = overrideDest ? destAddl : TARGET_ADDL;
     String myAddrHex = toHex4((MY_ADDH << 8) | MY_ADDL);
+    String toAddrHex = toHex4((((uint16_t)finalAddh) << 8) | finalAddl);
     String msgId = toHex4(++txMessageCounter);
-    String payload = "MSG|" + msgId + "|" + myAddrHex + "|" + msg;
+    String payload = "MSG2|" + msgId + "|" + myAddrHex + "|" + toAddrHex + "|" + radioEscapeField(msg);
+    String displayMsg = formatStructuredMessage(myAddrHex, toAddrHex, msg);
 
     bool acked = false;
     for (uint8_t attempt = 0; attempt <= ACK_RETRY_MAX; attempt++) {
@@ -590,12 +646,12 @@ bool sendMessage(String msg, bool viaRepeater = false, uint8_t destAddh = 0xFF, 
     }
 
     sentCount++;
-    lastSent = msg;
+    lastSent = displayMsg;
     statusMsg = acked ? "SENT ACK" : "SENT NO ACK";
     if (viaRepeater) {
-        addLogEntry(acked ? "TX-RELAY-ACK" : "TX-RELAY-NOACK", 0, toHex4((REPEATER_ADDH << 8) | REPEATER_ADDL), msg);
+        addLogEntry(acked ? "TX-RELAY-ACK" : "TX-RELAY-NOACK", 0, toHex4((REPEATER_ADDH << 8) | REPEATER_ADDL), displayMsg);
     } else {
-        addLogEntry(acked ? "TX-ACK" : "TX-NOACK", 0, toHex4((finalAddh << 8) | finalAddl), msg);
+        addLogEntry(acked ? "TX-ACK" : "TX-NOACK", 0, toHex4((finalAddh << 8) | finalAddl), displayMsg);
     }
     return acked;
 }
@@ -628,6 +684,31 @@ void checkIncoming() {
     }
 
     // MSG frame format: MSG|<msgId>|<srcAddrHex>|<body>
+    // New format: MSG2|<msgId>|<fromContactId>|<toContactId>|<urlEncodedBody>
+    if (payload.startsWith("MSG2|")) {
+        int p1 = payload.indexOf('|');           // after MSG2
+        int p2 = payload.indexOf('|', p1 + 1);   // after id
+        int p3 = payload.indexOf('|', p2 + 1);   // after from
+        int p4 = payload.indexOf('|', p3 + 1);   // after to
+        if (p1 >= 0 && p2 > p1 && p3 > p2 && p4 > p3) {
+            String msgId = payload.substring(p1 + 1, p2);
+            String fromContactId = payload.substring(p2 + 1, p3);
+            String toContactId = payload.substring(p3 + 1, p4);
+            String body = radioUnescapeField(payload.substring(p4 + 1));
+
+            int16_t srcAddr = parseHex16(fromContactId);
+            if (srcAddr >= 0) {
+                uint8_t srcAddh = (uint8_t)((srcAddr >> 8) & 0xFF);
+                uint8_t srcAddl = (uint8_t)(srcAddr & 0xFF);
+                String ackPayload = "ACK|" + msgId;
+                e22.sendFixedMessage(srcAddh, srcAddl, CHANNEL, ackPayload);
+            }
+
+            payload = formatStructuredMessage(fromContactId, toContactId, body);
+        }
+    }
+
+    // Legacy frame format: MSG|<msgId>|<srcAddrHex>|<body>
     if (payload.startsWith("MSG|")) {
         int p1 = payload.indexOf('|');          // after MSG
         int p2 = payload.indexOf('|', p1 + 1);  // after id
@@ -645,7 +726,7 @@ void checkIncoming() {
                 e22.sendFixedMessage(srcAddh, srcAddl, CHANNEL, ackPayload);
             }
 
-            payload = body;
+            payload = formatStructuredMessage(srcHex, toHex4((MY_ADDH << 8) | MY_ADDL), body);
         }
     }
 
@@ -1152,6 +1233,11 @@ void handleSetPowerSave() {
 void handleSend() {
     if (server.hasArg("msg")) {
         String msg = server.arg("msg");
+        msg.trim();
+        if (msg.length() == 0) {
+            server.send(400, "text/plain", "Empty msg parameter");
+            return;
+        }
         bool useRelay = server.hasArg("relay");
         bool overrideDest = false;
         uint8_t destAddh = 0;
