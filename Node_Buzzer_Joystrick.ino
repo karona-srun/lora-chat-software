@@ -18,7 +18,7 @@
 Preferences preferences;
 
 uint8_t MY_ADDH = 0x00;
-uint8_t MY_ADDL = 0x02;     // Default Node ID
+uint8_t MY_ADDL = 0x04;     // Default Node ID
 uint8_t TARGET_ADDH = 0x00;
 uint8_t TARGET_ADDL = 0x00; // Default Target
 uint8_t REPEATER_ADDH = 0xFF;
@@ -39,7 +39,9 @@ String defaultApSsid() {
     return "LM-" + String(MY_ADDL);
 }
 
-#define BAT_READER    36  // ADC pin for battery voltage
+#define BUZZER_ACTIVE 15 // Buzzer for alert sound
+
+#define BAT_READER    35  // ADC pin for battery voltage  // 35 New ADC pin for battery voltage
 #define BAT_CHARGING  34  // HIGH when charging (input only)
 
 // Battery ADC: 0–4095 @ 3.3V; adjust divider so 4.2V battery → ~3.3V at pin
@@ -50,14 +52,22 @@ String defaultApSsid() {
 #define BAT_V_MAX     4.20   // battery "full" voltage
 #define BAT_DIVIDER   (4.20 / 3.60)  // scale ADC to battery voltage if needed
 
-#define BTN_NEXT_PIN  32  // next screen button, pressed = LOW
-#define BTN_PREV_PIN  35  // previous screen button, pressed = LOW (input-only pin)
+// Five-way control: Left/Right change screen; Up/Down adjust values in settings edit;
+// Select opens Display settings from other screens; on Display screen, Select toggles edit.
+// All pressed = LOW.
+#define BTN_LEFT_PIN    23
+#define BTN_RIGHT_PIN   32
+#define BTN_UP_PIN      5
+#define BTN_DOWN_PIN    13
+#define BTN_SELECT_PIN  14
 
 // ────────────────────────────────────────────────
 // GPS on Serial1
 // ────────────────────────────────────────────────
-#define GPS_TX_PIN  25
-#define GPS_RX_PIN  26
+// #define GPS_TX_PIN  25 //Old pins GPS old board (Black Box)
+// #define GPS_RX_PIN  26
+#define GPS_TX_PIN  26  // New pins GPS new board (Green Box)
+#define GPS_RX_PIN  25
 #define GPS_BAUD    9600
 
 TinyGPSPlus gps;
@@ -79,11 +89,14 @@ bool batteryCharging   = false;
 bool lastBatteryCharging = false;
 
 int currentScreen = 0;
-unsigned long lastNextBtnPress = 0;
-unsigned long lastPrevBtnPress = 0;
-bool nextBtnHeld = false;
-bool nextBtnLongSent = false;
-unsigned long nextBtnDownMs = 0;
+unsigned long lastRightBtnPress = 0;
+unsigned long lastLeftBtnPress = 0;
+unsigned long lastUpBtnPress = 0;
+unsigned long lastDownBtnPress = 0;
+unsigned long lastSelectBtnPress = 0;
+bool rightBtnHeld = false;
+bool rightBtnLongSent = false;
+unsigned long rightBtnDownMs = 0;
 bool chargeScreenSuppressed = false;
 
 enum class PopupType : uint8_t { None, Sent, Received };
@@ -94,10 +107,25 @@ unsigned long popupUntilMs = 0;
 
 const bool AUTO_GPS_ENABLED = false;
 const unsigned long AUTO_GPS_INTERVAL_MS = 5000UL;
-const unsigned long BTN_NEXT_LONG_PRESS_MS = 3000UL;
+const unsigned long BTN_RIGHT_LONG_PRESS_MS = 3000UL;
+// Display screen: hold SELECT this long to write sleep/brightness to flash
+const unsigned long BTN_SETTINGS_HOLD_SAVE_MS = 700UL;
 const unsigned long CHARGE_PIN_DEBOUNCE_MS = 400UL;
 const unsigned long UI_REFRESH_NORMAL_MS = 5000UL;
-const unsigned long UI_REFRESH_CHARGING_MS = 1000UL;
+// Faster redraw while the charging screen is shown so the battery animation stays smooth.
+const unsigned long UI_REFRESH_CHARGING_MS = 120UL;
+
+#define NUM_SCREENS 4
+
+// OLED display settings (persisted)
+uint8_t oledSleepMode = 3;   // 0=10s, 1=40s, 2=1min, 3=never
+uint8_t oledBrightPct = 90;  // 0–100
+bool oledDisplayOff = false;
+unsigned long lastDisplayActivityMs = 0;
+uint8_t settingsEditField = 0;   // focused row: 0=sleep, 1=brightness (U/D)
+bool settingsAdjusting = false;  // true: L/R change values (preview, not flash)
+bool settingsDirty = false;      // true: preview differs from last save
+bool oledIgnoreButtonsUntilRelease = false;
 
 // ----------------------------- E22 pins --------------------------------------
 #define PIN_E22_TX   4
@@ -211,8 +239,15 @@ void loadConfig() {
     if (ssid_AP.length() == 0) ssid_AP = defaultApSsid();
     E22_TX_POWER = preferences.getUChar("tx_power", E22_TX_POWER);
     if (E22_TX_POWER > 3) E22_TX_POWER = 0;
+    oledSleepMode = preferences.getUChar("oled_sleep", oledSleepMode);
+    if (oledSleepMode > 3) oledSleepMode = 3;
+    oledBrightPct = preferences.getUChar("oled_bright", oledBrightPct);
+    if (oledBrightPct > 100) oledBrightPct = 100;
     
     preferences.end();
+
+    settingsDirty = false;
+    settingsAdjusting = false;
     
     Serial.println("\n=== Loaded Configuration ===");
     Serial.printf("My Address: 0x%02X%02X\n", MY_ADDH, MY_ADDL);
@@ -240,10 +275,19 @@ void saveConfig() {
     preferences.putBool("use_repeater", USE_REPEATER);
     preferences.putUShort("crypt", CRYPT);
     preferences.putUChar("tx_power", E22_TX_POWER);
+    preferences.putUChar("oled_sleep", oledSleepMode);
+    preferences.putUChar("oled_bright", oledBrightPct);
     
     preferences.end();
     
     Serial.println("Configuration saved!");
+}
+
+void saveOledSettings() {
+    preferences.begin("lora-config", false);
+    preferences.putUChar("oled_sleep", oledSleepMode);
+    preferences.putUChar("oled_bright", oledBrightPct);
+    preferences.end();
 }
 
 void saveApConfig() {
@@ -251,6 +295,73 @@ void saveApConfig() {
     preferences.putString("ssid_ap", ssid_AP);
     preferences.end();
     Serial.printf("AP SSID saved to flash: %s\n", ssid_AP.c_str());
+}
+
+static unsigned long oledSleepTimeoutMs() {
+    switch (oledSleepMode) {
+        case 0: return 10000UL;
+        case 1: return 40000UL;
+        case 2: return 60000UL;
+        default: return 0;
+    }
+}
+
+static const char *oledSleepLabel(uint8_t mode) {
+    switch (mode) {
+        case 0: return "10s";
+        case 1: return "40s";
+        case 2: return "1m";
+        default: return "Never";
+    }
+}
+
+void applyOledBrightness() {
+    uint8_t c = (uint8_t)((unsigned long)oledBrightPct * 255UL / 100UL);
+    display.ssd1306_command(SSD1306_SETCONTRAST);
+    display.ssd1306_command(c);
+}
+
+static void oledHardwarePower(bool on) {
+    display.ssd1306_command((uint8_t)(on ? SSD1306_DISPLAYON : SSD1306_DISPLAYOFF));
+}
+
+void noteDisplayActivity() {
+    lastDisplayActivityMs = millis();
+}
+
+void tryWakeOledFromSleep() {
+    if (!oledDisplayOff) return;
+    oledHardwarePower(true);
+    oledDisplayOff = false;
+    applyOledBrightness();
+    drawCurrentScreen();
+}
+
+void checkOledSleepTimeout() {
+    if (oledDisplayOff) return;
+    if (batteryCharging && !chargeScreenSuppressed) return;
+    if (settingsAdjusting) return;
+    if (currentScreen == 3 && settingsDirty) return;
+    unsigned long to = oledSleepTimeoutMs();
+    if (to == 0) return;
+    if ((millis() - lastDisplayActivityMs) >= to) {
+        oledHardwarePower(false);
+        oledDisplayOff = true;
+    }
+}
+
+// Change values in RAM only; call saveOledSettings() after hold-SELECT on Display screen.
+static void previewSettingsAdjust(int dir) {
+    if (settingsEditField == 0) {
+        int v = (int)oledSleepMode + dir;
+        while (v < 0) v += 4;
+        oledSleepMode = (uint8_t)(v % 4);
+    } else {
+        int b = (int)oledBrightPct + dir * 5;
+        oledBrightPct = (uint8_t)constrain(b, 0, 100);
+        applyOledBrightness();
+    }
+    settingsDirty = true;
 }
 
 // =============================================================================
@@ -1658,6 +1769,13 @@ void readBattery() {
   // Re-enable charging screen automatically on a new charging event.
   if (batteryCharging && !lastBatteryCharging) {
     chargeScreenSuppressed = false;
+    if (oledDisplayOff) {
+      oledHardwarePower(true);
+      oledDisplayOff = false;
+      applyOledBrightness();
+    }
+    noteDisplayActivity();
+    drawCurrentScreen();
   }
 }
 
@@ -1691,6 +1809,43 @@ String getGPSMessage() {
   snprintf(buf, sizeof(buf), "No fix  Sats:%02lu  T:%lus",
            (unsigned long)gps.satellites.value(), (unsigned long)(millis() / 1000));
   return String(buf);
+}
+
+// ────────────────────────────────────────────────
+// OLED layout helpers (1px font = ~6px wide per character)
+// ────────────────────────────────────────────────
+static void drawScreenDivider() {
+  // display.drawFastHLine(0, 14, SCREEN_WIDTH, SSD1306_WHITE);
+}
+
+static String ellipsizeMaxChars(const String &s, size_t maxChars) {
+  if ((size_t)s.length() <= maxChars) return s;
+  if (maxChars <= 1) return String(".");
+  return s.substring(0, maxChars - 1) + ".";
+}
+
+// Small “signal bars” glyph used as a nodes / mesh hint (replaces opaque control chars).
+static void drawTinySignalGlyph(int x, int y) {
+  display.drawFastVLine(x, y + 4, 3, SSD1306_WHITE);
+  display.drawFastVLine(x + 2, y + 2, 5, SSD1306_WHITE);
+  display.drawFastVLine(x + 4, y, 7, SSD1306_WHITE);
+}
+
+// Bottom page dots: active filled, others hollow for clearer hierarchy.
+static void drawScreenPageDots() {
+  const int n = NUM_SCREENS;
+  const int cy = 61;
+  const int spacing = 10;
+  const int totalW = (n - 1) * spacing;
+  const int startX = (SCREEN_WIDTH - totalW) / 2;
+  for (int i = 0; i < n; i++) {
+    const int cx = startX + i * spacing;
+    if (i == currentScreen) {
+      display.fillCircle(cx, cy, 2, SSD1306_WHITE);
+    } else {
+      display.drawCircle(cx, cy, 1, SSD1306_WHITE);
+    }
+  }
 }
 
 // ────────────────────────────────────────────────
@@ -1753,23 +1908,6 @@ void drawHeader() {
 // OLED drawing - Meshtastic-style layout
 // ────────────────────────────────────────────────
 
-// Bottom page indicator: 3 screens — small dots for others, larger dot for current.
-static void drawScreenPageDots() {
-  const int n = 3;
-  const int cy = 61;
-  const int spacing = 14;
-  const int totalW = (n - 1) * spacing;
-  const int startX = (SCREEN_WIDTH - totalW) / 2;
-  for (int i = 0; i < n; i++) {
-    const int cx = startX + i * spacing;
-    if (i == currentScreen) {
-      display.fillCircle(cx, cy, 1  , SSD1306_WHITE);
-    } else {
-      display.fillCircle(cx, cy, 0, SSD1306_WHITE);
-    }
-  }
-}
-
 // Screen 1: Status screen
 // ────────────────────────────────────────────────
 void drawStatusScreen() {
@@ -1777,6 +1915,7 @@ void drawStatusScreen() {
   
   // Draw header with rounded corners
   drawHeader();
+  drawScreenDivider();
   
   display.setTextSize(1);
   display.setTextColor(SSD1306_WHITE);
@@ -1784,61 +1923,50 @@ void drawStatusScreen() {
   // Same source as /api/nodes: registry + ONLINE_NODE_TTL_MS
   syncOnlineNodesFromRegistry();
   
-  // Line 2: Online nodes and Uptime
-  display.setCursor(2, 16);
-  display.print((char)0x09);
+  drawTinySignalGlyph(4, 16);
+  display.setCursor(12, 16);
   display.print(onlineNodes);
-  display.print(" online");
-  
-  display.setCursor(74, 16);
-  display.print("Up:");
+  display.print(" nodes");
+  display.setCursor(72, 16);
+  display.print("Up ");
   display.print(getUptime());
   
-  // Line 3: Satellites and Voltage
-  display.setCursor(2, 26);
-  display.print("#");
+  display.setCursor(4, 26);
+  display.print("GPS ");
   display.print(gps.satellites.value());
   display.print(" sats");
-  
   display.setCursor(82, 26);
   display.print(batteryVoltage, 2);
-  display.print("V");
+  display.print(" V");
   
-  // Line 4: Channel Utilization
-  display.setCursor(2, 37);
-  display.print("ChUtil.");
-  
-  int chUtil = 0;
-  int barX = 50;
-  int barY = 37;
-  int barWidth = 48;
-  display.drawRect(barX, barY, barWidth, 6, SSD1306_WHITE);
+  const int chUtil = 0;
+  display.setCursor(4, 37);
+  display.print("CH");
+  const int barX = 22;
+  const int barY = 37;
+  const int barWidth = 74;
+  display.drawRoundRect(barX, barY, barWidth, 7, 2, SSD1306_WHITE);
   if (chUtil > 0) {
-    int fillWidth = (chUtil * (barWidth - 2)) / 100;
-    display.fillRect(barX + 1, barY + 1, fillWidth, 4, SSD1306_WHITE);
+    int fillWidth = (chUtil * (barWidth - 4)) / 100;
+    if (fillWidth > 0) {
+      display.fillRoundRect(barX + 2, barY + 2, fillWidth, 3, 1, SSD1306_WHITE);
+    }
   }
-  
   display.setCursor(100, 37);
   display.print(chUtil);
   display.print("%");
   
-  // Line 5: Callsign
-  display.setCursor(20, 49);
-  display.setTextSize(1);
-  display.print(ssid_AP);
-  display.setTextSize(1);
-  display.print(" (DBR)");
-  
-  // Bottom progress bar (width = SCREEN_WIDTH/2, centered) — above page dots
-  // int progress = 0;
-  // int progBarWidth = SCREEN_WIDTH / 2;  // 64
-  // int progBarX = (SCREEN_WIDTH - progBarWidth) / 2;  // centered
-  // int progBarY = 57;  // above page dots (cy=61); below callsign row (y=49)
-  // display.drawRect(progBarX, progBarY, progBarWidth, 2, SSD1306_WHITE);
-  // if (progress > 0) {
-  //   int fillWidth = (progress * (progBarWidth - 2)) / 100;
-  //   display.fillRect(progBarX + 1, progBarY + 1, fillWidth, 1, SSD1306_WHITE);
-  // }
+  {
+    String line = ellipsizeMaxChars(ssid_AP, 16);
+    line += "  DBR";
+    int16_t x1, y1;
+    uint16_t w, h;
+    display.getTextBounds(line.c_str(), 0, 0, &x1, &y1, &w, &h);
+    int cx = (SCREEN_WIDTH - (int)w) / 2;
+    if (cx < 0) cx = 0;
+    display.setCursor(cx, 50);
+    display.print(line);
+  }
 
   drawScreenPageDots();
   display.display();
@@ -1850,40 +1978,40 @@ void drawStatusScreen() {
 void drawWifiScreen() {
   display.clearDisplay();
   drawHeader();
+  drawScreenDivider();
   
   display.setTextSize(1);
   display.setTextColor(SSD1306_WHITE);
+
+  // display.setCursor(4, 16);
+  // display.print("Hotspot");
   
   // Row 1: Wi-Fi SSID with signal icon
-  // Simple 3-bar Wi-Fi symbol on the left
   const int wifiIconX = 4;
-  const int wifiIconY = 18;
+  const int wifiIconY = 22;
   display.drawLine(wifiIconX,     wifiIconY + 6, wifiIconX + 3, wifiIconY + 3, SSD1306_WHITE);
   display.drawLine(wifiIconX + 3, wifiIconY + 3, wifiIconX + 6, wifiIconY + 6, SSD1306_WHITE);
   display.drawPixel(wifiIconX + 3, wifiIconY + 7, SSD1306_WHITE);
-  // Text shifted right to make room for icon
-  display.setCursor(16, 18);
-  display.print("SSID:");
-  display.print(ssid_AP);
+  display.setCursor(16, 22);
+  display.print("SSID ");
+  display.print(ellipsizeMaxChars(ssid_AP, 14));
   
-  // Row 2: Password with key icon
   const int keyX = 4;
-  const int keyY = 30;
-  display.drawCircle(keyX + 2, keyY + 2, 2, SSD1306_WHITE);              // key head
-  display.drawLine(keyX + 4, keyY + 2, keyX + 8, keyY + 2, SSD1306_WHITE); // shaft
-  display.drawPixel(keyX + 8, keyY + 1, SSD1306_WHITE);                  // tooth
-  display.drawPixel(keyX + 8, keyY + 3, SSD1306_WHITE);                  // tooth
-  display.setCursor(16, 30);
-  display.print("PASS:");
-  display.print(password_AP);
+  const int keyY = 34;
+  display.drawCircle(keyX + 2, keyY + 2, 2, SSD1306_WHITE);
+  display.drawLine(keyX + 4, keyY + 2, keyX + 8, keyY + 2, SSD1306_WHITE);
+  display.drawPixel(keyX + 8, keyY + 1, SSD1306_WHITE);
+  display.drawPixel(keyX + 8, keyY + 3, SSD1306_WHITE);
+  display.setCursor(16, 34);
+  display.print("PASS ");
+  display.print(ellipsizeMaxChars(password_AP, 14));
   
-  // Row 3: IP address with small screen/monitor icon
   const int ipIconX = 4;
-  const int ipIconY = 42;
-  display.drawRect(ipIconX, ipIconY, 9, 6, SSD1306_WHITE);  // screen
-  display.drawFastHLine(ipIconX + 2, ipIconY + 7, 5, SSD1306_WHITE); // base
-  display.setCursor(16, 42);
-  display.print("IP: ");
+  const int ipIconY = 46;
+  display.drawRect(ipIconX, ipIconY, 9, 6, SSD1306_WHITE);
+  display.drawFastHLine(ipIconX + 2, ipIconY + 7, 5, SSD1306_WHITE);
+  display.setCursor(16, 46);
+  display.print("IP ");
   display.print(WiFi.softAPIP().toString());
 
   drawScreenPageDots();
@@ -1938,9 +2066,9 @@ static void drawNavigationCompass(double bearingDeg, bool bearingValid) {
     // Cardinal letter + bearing degrees
     const char dirLetters[] = {'N', 'E', 'S', 'W'};
     const int dirIdx = ((int)((bearingDeg + 45.0) / 90.0)) % 4;
-    display.setCursor(88, 54);
+    display.setCursor(86, 54);
     display.print(dirLetters[dirIdx]);
-    display.print(':');
+    display.print(' ');
     display.print((int)bearingDeg);
   } else {
     // No course: draw an X inside the compass.
@@ -1953,13 +2081,15 @@ void drawGpsScreen() {
   getGPSMessage();
   display.clearDisplay();
   drawHeader();
+  drawScreenDivider();
   
   display.setTextSize(1);
   display.setTextColor(SSD1306_WHITE);
   
   display.setCursor(4, 16);
-  display.print("Sats: ");
+  display.print("GPS ");
   display.print(gps.satellites.value());
+  display.print(" sv");
 
   // Right side navigation compass (uses GPS course/track angle).
   const bool courseValid = gps.course.isValid();
@@ -1968,86 +2098,165 @@ void drawGpsScreen() {
   
   if (gps.location.isValid()) {
     display.setCursor(4, 26);
-    display.print("Lat: ");
+    display.print("Lat ");
     display.print(gps.location.lat(), 5);
     display.setCursor(4, 36);
-    display.print("Lng: ");
+    display.print("Lng ");
     display.print(gps.location.lng(), 5);
     if (gps.altitude.isValid()) {
       display.setCursor(4, 46);
-      display.print("Alt: ");
+      display.print("Alt ");
       display.print((int)gps.altitude.meters());
-      display.print("m");
+      display.print(" m");
     }
   } else {
     display.setCursor(4, 28);
-    display.print("No GPS fix");
+    display.print("No fix yet");
     display.setCursor(4, 40);
-    display.print("Sats: ");
+    display.print("In view ");
     display.print(gps.satellites.value());
   }
 
-  // Short uptime at bottom-left to avoid overlapping the right compass.
   unsigned long seconds = (millis() - startTime) / 1000;
   unsigned long hours = seconds / 3600;
   unsigned long minutes = (seconds % 3600) / 60;
   char upBuf[16];
   snprintf(upBuf, sizeof(upBuf), "%luh%lum", hours, minutes);
   display.setCursor(4, 52);
-  display.print("Up:");
+  display.print("Up ");
   display.print(upBuf);
 
   drawScreenPageDots();
-  Serial.println("----------------------------");
-  Serial.print("GPS Satellites -> ");
-  Serial.println(gps.satellites.value());
-  Serial.print("Lat: ");
-  Serial.println(gps.location.lat(), 5);
-  Serial.print("Lng: ");
-  Serial.println(gps.location.lng(), 5);
-  Serial.println("----------------------------");
   display.display();
 }
 
 // ────────────────────────────────────────────────
-// Screen 4: Charging screen
+// Screen 4: Display settings — U/D row, SEL toggles L/R adjust, hold SEL saves
+// Layout tuned for 128x64 (e.g. 1.54" SSD1306): airy cards, soft radius, clear hierarchy
+// ────────────────────────────────────────────────
+static void drawSettingsRow(int x, int w, int rowTop, int rowH, bool focused, bool adjusting,
+                            const __FlashStringHelper *label, const char *valueStr) {
+  const int r = 4;
+  const int textY = rowTop + 2;
+
+  if (adjusting) {
+    display.fillRoundRect(x, rowTop, w, rowH, r, SSD1306_WHITE);
+    display.setTextColor(SSD1306_BLACK);
+  } else {
+    display.setTextColor(SSD1306_WHITE);
+    if (focused) {
+      display.fillRoundRect(x + 2, rowTop + 3, 3, rowH - 6, 1, SSD1306_WHITE);
+    }
+  }
+
+  display.setCursor(x + (focused && !adjusting ? 10 : 8), textY);
+  display.print(label);
+
+  int16_t bx, by;
+  uint16_t bw, bh;
+  display.getTextBounds(valueStr, 0, 0, &bx, &by, &bw, &bh);
+  display.setCursor(x + w - 8 - (int)bw, textY);
+  display.print(valueStr);
+}
+
+void drawSettingsScreen() {
+  display.clearDisplay();
+  drawHeader();
+  drawScreenDivider();
+
+  const int mx = 8;
+  const int cardW = SCREEN_WIDTH - 2 * mx;
+  const int cardX = mx;
+  const int rowH = 11;
+  const int rowGap = 2;
+  const int row1Top = 27;
+  const int row2Top = row1Top + rowH + rowGap;
+
+  display.setTextSize(1);
+
+  // Title row: light weight, unsaved = soft dot (not noisy asterisk)
+  display.setTextColor(SSD1306_WHITE);
+  display.setCursor(mx, 16);
+  display.print(F("Display"));
+  if (settingsDirty) {
+    display.fillCircle(118, 19, 2, SSD1306_WHITE);
+  }
+
+  char sleepStr[8];
+  snprintf(sleepStr, sizeof(sleepStr), "%s", oledSleepLabel(oledSleepMode));
+  drawSettingsRow(cardX, cardW, row1Top, rowH, settingsEditField == 0,
+                  settingsAdjusting && settingsEditField == 0, F("Sleep"), sleepStr);
+
+  char pctStr[8];
+  snprintf(pctStr, sizeof(pctStr), "%u%%", (unsigned)oledBrightPct);
+  drawSettingsRow(cardX, cardW, row2Top, rowH, settingsEditField == 1,
+                  settingsAdjusting && settingsEditField == 1, F("Brightness"), pctStr);
+
+  drawScreenPageDots();
+  display.display();
+}
+
+// ────────────────────────────────────────────────
+// Screen 5: Charging screen
 // ────────────────────────────────────────────────
 void drawChargingScreen() {
   display.clearDisplay();
 
+  display.setTextSize(1);
   display.setTextColor(SSD1306_WHITE);
-  display.setTextSize(2);
-  display.setCursor(18, 12);
-  display.print("CHARGING");
 
-  // Big battery icon
-  const int x = 44;
-  const int y = 32;
-  const int w = 36;
-  const int h = 18;
-  display.drawRect(x, y, w, h, SSD1306_WHITE);
-  display.fillRect(x + w, y + 5, 3, 8, SSD1306_WHITE); // battery nub
+  // One line: "Charging" + 0–3 animated dots, centered
+  unsigned ndots = (unsigned)(millis() / 280UL) % 4U;
+  char titleLine[16];
+  int n = snprintf(titleLine, sizeof(titleLine), "Charging");
+  if (n < 0) n = 0;
+  for (unsigned i = 0; i < ndots && n < (int)sizeof(titleLine) - 1; i++)
+    titleLine[n++] = '.';
+  titleLine[n] = '\0';
 
-  display.fillRect(x + 2, y + 2, w-4, h - 4, SSD1306_WHITE);
-
-  // Lightning bolt blinks and moves slightly while charging.
-  bool blinkOn = ((millis() / 400UL) % 2UL) == 0UL;
-  if (blinkOn) {
-    int px = x + 11;
-    int py = y + 4;
-
-    // Cable
-    display.drawFastHLine(px - 4, py + 4, 4, SSD1306_BLACK);
-    // Plug body
-    display.fillRoundRect(px, py + 1, 7, 7, 1, SSD1306_BLACK);
-    // Prongs
-    display.fillRect(px + 7, py + 2, 2, 1, SSD1306_BLACK);
-    display.fillRect(px + 7, py + 6, 2, 1, SSD1306_BLACK);
+  {
+    int16_t tx, ty;
+    uint16_t tw, th;
+    display.getTextBounds(titleLine, 0, 0, &tx, &ty, &tw, &th);
+    display.setCursor((SCREEN_WIDTH - (int)tw) / 2, 17);
+    display.print(titleLine);
   }
 
-  display.setTextSize(1);
-  display.setCursor(2, 56);
-  display.print("Hold NEXT 3s: Normal");
+  // Compact battery: small body + nub, animated fill inside
+  const int batX = 46;
+  const int batY = 30;
+  const int bodyW = 30;
+  const int bodyH = 12;
+  display.drawRoundRect(batX, batY, bodyW, bodyH, 2, SSD1306_WHITE);
+  display.fillRect(batX + bodyW, batY + 4, 2, 4, SSD1306_WHITE);
+
+  const int inX = batX + 2;
+  const int inY = batY + 2;
+  const int inW = bodyW - 4;
+  const int inH = bodyH - 4;
+
+  // Smooth “breathing” level inside the cell (loops while plugged in)
+  const unsigned long breathMs = 1400UL;
+  unsigned long ph = millis() % breathMs;
+  int fillW;
+  if (ph < breathMs / 2)
+    fillW = (int)((unsigned long)inW * ph / (breathMs / 2));
+  else
+    fillW = (int)((unsigned long)inW * (breathMs - ph) / (breathMs / 2));
+  fillW = constrain(fillW, 1, inW);
+  display.fillRect(inX, inY, fillW, inH, SSD1306_WHITE);
+
+  // Thin “shimmer” line moving across the filled area (visible on 1bpp OLEDs)
+  if (fillW >= 4) {
+    const int nSeg = 5;
+    int segPx = max(1, fillW / nSeg);
+    int march = (int)((millis() / 100UL) % (unsigned long)(nSeg + 1));
+    int hx = constrain(inX + march * segPx, inX, inX + fillW - 2);
+    display.drawFastVLine(hx, inY, inH, SSD1306_BLACK);
+  }
+
+  display.setCursor(4, 56);
+  display.print(F("RIGHT 3s: main"));
   display.display();
 }
 
@@ -2055,49 +2264,58 @@ void drawChargingScreen() {
 // Draw current screen (router)
 // ────────────────────────────────────────────────
 void drawCurrentScreen() {
+  if (oledDisplayOff) {
+    if (batteryCharging && !chargeScreenSuppressed) {
+      oledHardwarePower(true);
+      oledDisplayOff = false;
+      applyOledBrightness();
+    } else {
+      return;
+    }
+  }
   if (batteryCharging && !chargeScreenSuppressed) {
     drawChargingScreen();
   } else if (currentScreen == 0) {
     drawStatusScreen();
   } else if (currentScreen == 1) {
     drawWifiScreen();
-  } else {
+  } else if (currentScreen == 2) {
     drawGpsScreen();
+  } else {
+    drawSettingsScreen();
   }
 }
 
 void showSent(const String &message, const String &status) {
+  (void)status;
   display.clearDisplay();
-  
-  // Draw header with rounded corners
   drawHeader();
-  
-  // Draw line
-  // display.drawFastHLine(0, 13, 128, SSD1306_WHITE);
-  
-  display.setTextSize(2);
-  display.setCursor(35, 19);
-  display.println("SENT");
+  drawScreenDivider();
 
-  display.setTextSize(1);
-  display.setCursor(0, 39);
-  display.print("-> ");
-  
-  // Two-line preview for long text
-  String line1 = message.substring(0, 18);
-  String line2 = "";
-  if (message.length() > 18) {
-    line2 = message.substring(18, min((int)message.length(), 36));
-    if (message.length() > 36) {
-      line2 += "...";
-    }
+  display.setTextSize(2);
+  display.setTextColor(SSD1306_WHITE);
+  {
+    const char *t = "SENT";
+    int16_t bx, by;
+    uint16_t bw, bh;
+    display.getTextBounds(t, 0, 0, &bx, &by, &bw, &bh);
+    display.setCursor((SCREEN_WIDTH - (int)bw) / 2, 22);
+    display.print(t);
   }
 
-  display.println(line1);
+  display.setTextSize(1);
+  String line1 = message.substring(0, 21);
+  String line2 = "";
+  if (message.length() > 21) {
+    line2 = message.substring(21, min((int)message.length(), 42));
+    if (message.length() > 42) line2 += ".";
+  }
+
+  display.setCursor(4, 42);
+  display.print(line1);
   if (line2.length() > 0) {
-    display.setCursor(0, 49);
-    display.print("   "); // indent under arrow
-    display.println(line2);
+    display.setCursor(4, 52);
+    display.print(line2);
   }
 
   display.display();
@@ -2149,11 +2367,15 @@ void setup() {
 
     // Initialize GPS
     gpsSerial.begin(GPS_BAUD, SERIAL_8N1, GPS_RX_PIN, GPS_TX_PIN);
-  
+    Serial.println("GPS UART1 started @ 9600 baud on pins 25(RX),26(TX)");
+    
     // Initialize OLED
     Wire.begin(OLED_SDA, OLED_SCL);
     display.begin(SSD1306_SWITCHCAPVCC, SCREEN_ADDRESS);
-    display.setRotation(2);
+    // display.setRotation(2);
+    display.setRotation(0);
+    applyOledBrightness();
+    noteDisplayActivity();
 
     // Initialize E22
     if (!e22.begin()) {
@@ -2172,9 +2394,17 @@ void setup() {
         statusMsg = "CFG FAIL";
     }
 
-    pinMode(BTN_NEXT_PIN, INPUT_PULLUP);
-    // GPIO35 has no internal pull-up/down on ESP32, so use external pull-up resistor.
-    pinMode(BTN_PREV_PIN, INPUT);
+    // Initialize Buzzer
+    pinMode(BUZZER_ACTIVE, OUTPUT);
+    digitalWrite(BUZZER_ACTIVE, LOW);
+
+    pinMode(BTN_LEFT_PIN, INPUT_PULLUP);
+    pinMode(BTN_RIGHT_PIN, INPUT_PULLUP);
+
+    pinMode(BTN_UP_PIN, INPUT_PULLUP);
+    pinMode(BTN_DOWN_PIN, INPUT_PULLUP);
+    pinMode(BTN_SELECT_PIN, INPUT_PULLUP);
+
     pinMode(BAT_READER, INPUT);
     pinMode(BAT_CHARGING, INPUT);
     readBattery();
@@ -2197,6 +2427,8 @@ void loop() {
     gps.encode(gpsSerial.read());
   }
 
+  checkOledSleepTimeout();
+
   if (nodeReady) {
       checkIncoming();
   }
@@ -2207,33 +2439,156 @@ void loop() {
       sendHelloBeacon();
   }
 
-  // Buttons
-  if (digitalRead(BTN_PREV_PIN) == LOW && (millis() - lastPrevBtnPress) > 300) {
-    lastPrevBtnPress = millis();
-    currentScreen = (currentScreen + 2) % 3;
-    popupType = PopupType::None;
-    drawCurrentScreen();
-  }
+  // Buttons (5-way: Left, Right, Up, Down, Select — all active-low)
+  bool leftLow = (digitalRead(BTN_LEFT_PIN) == LOW);
+  bool rightLow = (digitalRead(BTN_RIGHT_PIN) == LOW);
+  bool upLow = (digitalRead(BTN_UP_PIN) == LOW);
+  bool downLow = (digitalRead(BTN_DOWN_PIN) == LOW);
+  bool selectLow = (digitalRead(BTN_SELECT_PIN) == LOW);
+  bool anyNavLow = leftLow || rightLow || upLow || downLow || selectLow;
 
-  bool nextPressed = (digitalRead(BTN_NEXT_PIN) == LOW);
-  if (nextPressed) {
-    if (!nextBtnHeld) { nextBtnHeld = true; nextBtnLongSent = false; nextBtnDownMs = millis(); }
-    else if (!nextBtnLongSent && (millis() - nextBtnDownMs >= BTN_NEXT_LONG_PRESS_MS)) {
-      nextBtnLongSent = true;
-      chargeScreenSuppressed = true;
-      currentScreen = 0;
-      popupType = PopupType::None;
-      drawCurrentScreen();
+  if (oledIgnoreButtonsUntilRelease) {
+    if (!anyNavLow) oledIgnoreButtonsUntilRelease = false;
+  } else if (oledDisplayOff && anyNavLow) {
+    tryWakeOledFromSleep();
+    oledIgnoreButtonsUntilRelease = true;
+    noteDisplayActivity();
+  } else {
+    static bool leftBtnHeld = false;
+    static unsigned long leftBtnDownMs = 0;
+
+    if (leftLow) {
+      if (!leftBtnHeld) {
+        leftBtnHeld = true;
+        leftBtnDownMs = millis();
+      }
+    } else if (leftBtnHeld) {
+      unsigned long heldMs = millis() - leftBtnDownMs;
+      if (heldMs > 20 && (millis() - lastLeftBtnPress) > 300) {
+        lastLeftBtnPress = millis();
+        noteDisplayActivity();
+        popupType = PopupType::None;
+        if (currentScreen == 3 && settingsAdjusting) {
+          previewSettingsAdjust(-1);
+        } else if (currentScreen == 3) {
+          settingsAdjusting = false;
+          currentScreen = (currentScreen + NUM_SCREENS - 1) % NUM_SCREENS;
+        } else {
+          currentScreen = (currentScreen + NUM_SCREENS - 1) % NUM_SCREENS;
+        }
+        drawCurrentScreen();
+      }
+      leftBtnHeld = false;
     }
-  } else if (nextBtnHeld) {
-    unsigned long heldMs = millis() - nextBtnDownMs;
-    if (!nextBtnLongSent && heldMs > 20 && (millis() - lastNextBtnPress) > 300) {
-      lastNextBtnPress = millis();
-      currentScreen = (currentScreen + 1) % 3;
-      popupType = PopupType::None;
-      drawCurrentScreen();
+
+    if (rightLow) {
+      if (!rightBtnHeld) {
+        rightBtnHeld = true;
+        rightBtnLongSent = false;
+        rightBtnDownMs = millis();
+      } else if (!rightBtnLongSent && (millis() - rightBtnDownMs >= BTN_RIGHT_LONG_PRESS_MS)) {
+        rightBtnLongSent = true;
+        chargeScreenSuppressed = true;
+        currentScreen = 0;
+        settingsAdjusting = false;
+        popupType = PopupType::None;
+        noteDisplayActivity();
+        drawCurrentScreen();
+      }
+    } else if (rightBtnHeld) {
+      unsigned long heldMs = millis() - rightBtnDownMs;
+      if (!rightBtnLongSent && heldMs > 20 && (millis() - lastRightBtnPress) > 300) {
+        lastRightBtnPress = millis();
+        noteDisplayActivity();
+        popupType = PopupType::None;
+        if (currentScreen == 3 && settingsAdjusting) {
+          previewSettingsAdjust(1);
+        } else if (currentScreen == 3) {
+          settingsAdjusting = false;
+          currentScreen = (currentScreen + 1) % NUM_SCREENS;
+        } else {
+          currentScreen = (currentScreen + 1) % NUM_SCREENS;
+        }
+        drawCurrentScreen();
+      }
+      rightBtnHeld = false;
     }
-    nextBtnHeld = false;
+
+    static bool upHeld = false;
+    static unsigned long upDownMs = 0;
+    if (upLow) {
+      if (!upHeld) {
+        upHeld = true;
+        upDownMs = millis();
+      }
+    } else if (upHeld) {
+      unsigned long heldMs = millis() - upDownMs;
+      if (heldMs > 20 && (millis() - lastUpBtnPress) > 300 && currentScreen == 3) {
+        lastUpBtnPress = millis();
+        noteDisplayActivity();
+        popupType = PopupType::None;
+        settingsAdjusting = false;
+        settingsEditField = (uint8_t)((settingsEditField + 2 - 1) % 2);
+        drawCurrentScreen();
+      }
+      upHeld = false;
+    }
+
+    static bool downHeld = false;
+    static unsigned long downDownMs = 0;
+    if (downLow) {
+      if (!downHeld) {
+        downHeld = true;
+        downDownMs = millis();
+      }
+    } else if (downHeld) {
+      unsigned long heldMs = millis() - downDownMs;
+      if (heldMs > 20 && (millis() - lastDownBtnPress) > 300 && currentScreen == 3) {
+        lastDownBtnPress = millis();
+        noteDisplayActivity();
+        popupType = PopupType::None;
+        settingsAdjusting = false;
+        settingsEditField = (uint8_t)((settingsEditField + 1) % 2);
+        drawCurrentScreen();
+      }
+      downHeld = false;
+    }
+
+    static bool selectBtnHeld = false;
+    static unsigned long selectBtnDownMs = 0;
+    static bool selectHoldSaveDone = false;
+    if (selectLow) {
+      if (!selectBtnHeld) {
+        selectBtnHeld = true;
+        selectBtnDownMs = millis();
+        selectHoldSaveDone = false;
+      } else if (!selectHoldSaveDone && currentScreen == 3 &&
+                 (millis() - selectBtnDownMs >= BTN_SETTINGS_HOLD_SAVE_MS)) {
+        selectHoldSaveDone = true;
+        saveOledSettings();
+        settingsDirty = false;
+        settingsAdjusting = false;
+        noteDisplayActivity();
+        popupType = PopupType::None;
+        drawCurrentScreen();
+      }
+    } else if (selectBtnHeld) {
+      unsigned long heldMs = millis() - selectBtnDownMs;
+      if (!selectHoldSaveDone && heldMs > 20 && heldMs < BTN_SETTINGS_HOLD_SAVE_MS &&
+          (millis() - lastSelectBtnPress) > 300) {
+        lastSelectBtnPress = millis();
+        noteDisplayActivity();
+        popupType = PopupType::None;
+        if (currentScreen == 3) {
+          settingsAdjusting = !settingsAdjusting;
+        } else {
+          currentScreen = 3;
+          settingsAdjusting = false;
+        }
+        drawCurrentScreen();
+      }
+      selectBtnHeld = false;
+    }
   }
 
   if (popupType != PopupType::None && (long)(millis() - popupUntilMs) >= 0) {
