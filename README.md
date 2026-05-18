@@ -10,7 +10,7 @@ ESP32 firmware for a LoRa node using an **E22-900T33S** module. It exposes a **W
 - Periodic **`HELLO`** beacons and a **nearby-node registry** (RSSI, online TTL, optional GPS/call sign)
 - **Web UI** + JSON APIs for config, send, logs, and status
 - **OLED** multi-screen UI with header (battery %, time), page dots, popups, charging view
-- **Display** settings: OLED sleep timeout and brightness (preview in RAM, **hold Select** to save to flash)
+- **Display** settings: OLED sleep, brightness, and **new-message buzzer ON/OFF** (preview in RAM, **hold Select** to save to flash)
 - **GPS** on `Serial1` (**TinyGPSPlus**)
 - **Battery** ADC + **charging** detect; buzzer pin defined for alerts
 
@@ -72,7 +72,7 @@ Values are overridden after first save in **`Preferences`** namespace `lora-conf
 
 | Function | GPIO | Notes |
 |----------|------|--------|
-| Battery voltage ADC | **35** | Divider/scaling in firmware (`BAT_*` constants) |
+| Battery voltage ADC | **35** | 16-sample average; scale via `BAT_DIVIDER_RATIO` (default 4.2/3.3). **3.6 V → 5%**, **4.2 V → 100%** |
 | Charging detect (input) | **34** | HIGH when charging |
 | Buzzer (active) | **15** | |
 | Button **Left** | **23** | Active **LOW**, internal pull-up |
@@ -90,16 +90,16 @@ There are **`NUM_SCREENS` = 4** main pages (dots at the bottom show which page i
 0. **Status** — mesh-style summary (online nodes, etc.)
 1. **Wi‑Fi** — AP / connection info
 2. **GPS** — fix, satellites, uptime
-3. **Display** — sleep timeout + brightness (see below)
+3. **Display** — sleep, brightness, **Alerts** (buzzer for `MSG2`/`MSG` RX): **Up/Down** cycles three rows; **Select** then **Left/Right** adjusts (sleep steps, brightness ±5%, Alerts **OFF**/**ON**); **hold Select** saves.
 
-While **USB/charging** is detected (and the charging screen is not suppressed), the UI shows a **charging** animation instead of the normal pages. **Hold Right ~3 s** from that view jumps to the main flow and sets **`chargeScreenSuppressed`**.
+While **USB/charging** is detected (and the charging screen is not suppressed), the UI shows a **charging** animation (partial OLED updates to avoid flicker). The charge pin must stay **LOW ~2.5 s** before leaving charging mode so the screen does not blink. **Hold Right ~3 s** from that view jumps to the main flow and sets **`chargeScreenSuppressed`**.
 
 ### Five-way control (global)
 
 - **Left / Right** — previous / next **screen** (wraps), **except** on the **Display** screen when **value-adjust mode** is on (see below): then **Left / Right** change the value for the focused row (preview only until saved).
-- **Up / Down** — on **Display** screen only: move focus between **Sleep** and **Brightness**; clears value-adjust mode when changing row.
-- **Select (short)** — from any **other** screen: jump to **Display**. On **Display**: toggle **value-adjust mode** (L/R then adjusts sleep step or brightness in 5% steps).
-- **Select (hold ~700 ms)** — on **Display** only: **`saveOledSettings()`** (write sleep + brightness to flash), clear dirty flag, exit adjust mode.
+- **Up / Down** — on **Display** screen only: move focus between **Sleep**, **Brightness**, and **Alerts**; clears value-adjust mode when changing row.
+- **Select (short)** — from any **other** screen: jump to **Display**. On **Display**: toggle **value-adjust mode** (L/R then adjusts: sleep steps, brightness in 5% steps, Alerts **Left=OFF / Right=ON**).
+- **Select (hold ~700 ms)** — on **Display** only: **`saveOledSettings()`** (write sleep, brightness, and alert flag to flash), clear dirty flag, exit adjust mode.
 - **Right (hold ~3 s)** — force **screen 0**, suppress charging screen overlay, clear adjust mode (used as “home” shortcut).
 
 Unsaved OLED edits: title shows a small **dot** indicator; auto sleep is delayed while **adjusting** or while **dirty** on the Display screen.
@@ -120,6 +120,7 @@ Unsaved OLED edits: title shows a small **dot** indicator; auto sleep is delayed
 | Path | Purpose |
 |------|---------|
 | `/send` | Send message (query params: `msg`, optional `to`, `relay`) |
+| `/gps` | Send a fixed GPS summary over LoRa: `GPS,Stas,<sats>,<lat>,<lng>` (no fix: `lat,lng` = `0,0`). Same optional params as `/send`: `relay`, `to`, `addh` / `addl` |
 | `/config` | Save LoRa/AP-related config and **restart** |
 | `POST /setup/save` | Save AP SSID and **restart** |
 | `POST /setPower/save` | Save E22 TX power index and **restart** |

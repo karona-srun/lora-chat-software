@@ -18,7 +18,7 @@
 Preferences preferences;
 
 uint8_t MY_ADDH = 0x00;
-uint8_t MY_ADDL = 0x04;     // Default Node ID
+uint8_t MY_ADDL = 0x02;     // Default Node ID
 uint8_t TARGET_ADDH = 0x00;
 uint8_t TARGET_ADDL = 0x00; // Default Target
 uint8_t REPEATER_ADDH = 0xFF;
@@ -26,7 +26,7 @@ uint8_t REPEATER_ADDL = 0xFF;
 uint8_t NETWORK_ID = 0x01;  // Default Network ID
 uint8_t CHANNEL = 0x41;     // Default Channel 915Mhz
 uint16_t CRYPT = 0x8002;    // KEY 32770
-bool USE_REPEATER = false;  // Repeater mode
+bool USE_REPEATER = true;  // Repeater mode
 // E22 TX power: 0=POWER_22, 1=POWER_17, 2=POWER_13, 3=POWER_10 (see LoRa_E22 Option.transmissionPower)
 uint8_t E22_TX_POWER = 0;
 
@@ -44,13 +44,17 @@ String defaultApSsid() {
 #define BAT_READER    35  // ADC pin for battery voltage  // 35 New ADC pin for battery voltage
 #define BAT_CHARGING  34  // HIGH when charging (input only)
 
-// Battery ADC: 0–4095 @ 3.3V; adjust divider so 4.2V battery → ~3.3V at pin
-#define BAT_ADC_MAX   4095.0
+// Battery ADC: 12-bit, 0–3.3 V at pin (ADC_11db). Tune BAT_DIVIDER_RATIO to your divider.
+#define BAT_ADC_MAX        4095.0f
+#define BAT_ADC_VREF       3.30f    // ESP32 ADC reference at 11 dB attenuation
+#define BAT_DIVIDER_RATIO  (4.20f / 3.30f)  // Vbattery = Vadc_pin * ratio (4.2 V pack → ~3.3 V at pin)
 
-// Battery range: 3.3V (low) .. 4.2V (full)
-#define BAT_V_MIN     3.60   // battery "low" voltage
-#define BAT_V_MAX     4.20   // battery "full" voltage
-#define BAT_DIVIDER   (4.20 / 3.60)  // scale ADC to battery voltage if needed
+// Percent map: 3.6 V → 5%, 4.2 V → 100% (linear between)
+#define BAT_V_MIN          3.60f
+#define BAT_V_MAX          4.20f
+#define BAT_PCT_MIN        5
+#define BAT_PCT_MAX        100
+#define BAT_ADC_SAMPLES    16
 
 // Five-way control: Left/Right change screen; Up/Down adjust values in settings edit;
 // Select opens Display settings from other screens; on Display screen, Select toggles edit.
@@ -58,8 +62,8 @@ String defaultApSsid() {
 #define BTN_LEFT_PIN    23
 #define BTN_RIGHT_PIN   32
 #define BTN_UP_PIN      5
-#define BTN_DOWN_PIN    13
-#define BTN_SELECT_PIN  14
+#define BTN_DOWN_PIN    14
+#define BTN_SELECT_PIN  13
 
 // ────────────────────────────────────────────────
 // GPS on Serial1
@@ -98,6 +102,7 @@ bool rightBtnHeld = false;
 bool rightBtnLongSent = false;
 unsigned long rightBtnDownMs = 0;
 bool chargeScreenSuppressed = false;
+static bool chargeScreenUiReady = false;  // true after full charging screen paint (partial updates after)
 
 enum class PopupType : uint8_t { None, Sent, Received };
 PopupType popupType = PopupType::None;
@@ -105,15 +110,16 @@ String popupMsg = "";
 String popupStatus = "";
 unsigned long popupUntilMs = 0;
 
-const bool AUTO_GPS_ENABLED = false;
+const bool AUTO_GPS_ENABLED = true;
 const unsigned long AUTO_GPS_INTERVAL_MS = 5000UL;
 const unsigned long BTN_RIGHT_LONG_PRESS_MS = 3000UL;
 // Display screen: hold SELECT this long to write sleep/brightness to flash
 const unsigned long BTN_SETTINGS_HOLD_SAVE_MS = 700UL;
-const unsigned long CHARGE_PIN_DEBOUNCE_MS = 400UL;
+const unsigned long CHARGE_PIN_DEBOUNCE_MS = 400UL;   // pin HIGH this long → enter charging UI
+const unsigned long CHARGE_PIN_RELEASE_MS = 2500UL; // pin LOW this long → leave charging UI (stops flicker)
 const unsigned long UI_REFRESH_NORMAL_MS = 5000UL;
-// Faster redraw while the charging screen is shown so the battery animation stays smooth.
-const unsigned long UI_REFRESH_CHARGING_MS = 120UL;
+// Charging animation tick (partial OLED updates — no full clear every frame)
+const unsigned long UI_REFRESH_CHARGING_MS = 450UL;
 
 #define NUM_SCREENS 4
 
@@ -122,9 +128,10 @@ uint8_t oledSleepMode = 3;   // 0=10s, 1=40s, 2=1min, 3=never
 uint8_t oledBrightPct = 90;  // 0–100
 bool oledDisplayOff = false;
 unsigned long lastDisplayActivityMs = 0;
-uint8_t settingsEditField = 0;   // focused row: 0=sleep, 1=brightness (U/D)
+uint8_t settingsEditField = 0;   // focused row: 0=sleep, 1=brightness, 2=alert beep (U/D cycles)
 bool settingsAdjusting = false;  // true: L/R change values (preview, not flash)
 bool settingsDirty = false;      // true: preview differs from last save
+bool alertsBeepEnabled = true;   // buzzer on new MSG2/MSG (saved with OLED settings)
 bool oledIgnoreButtonsUntilRelease = false;
 
 // ----------------------------- E22 pins --------------------------------------
@@ -243,6 +250,7 @@ void loadConfig() {
     if (oledSleepMode > 3) oledSleepMode = 3;
     oledBrightPct = preferences.getUChar("oled_bright", oledBrightPct);
     if (oledBrightPct > 100) oledBrightPct = 100;
+    alertsBeepEnabled = preferences.getBool("alerts_beep", true);
     
     preferences.end();
 
@@ -277,6 +285,7 @@ void saveConfig() {
     preferences.putUChar("tx_power", E22_TX_POWER);
     preferences.putUChar("oled_sleep", oledSleepMode);
     preferences.putUChar("oled_bright", oledBrightPct);
+    preferences.putBool("alerts_beep", alertsBeepEnabled);
     
     preferences.end();
     
@@ -287,6 +296,7 @@ void saveOledSettings() {
     preferences.begin("lora-config", false);
     preferences.putUChar("oled_sleep", oledSleepMode);
     preferences.putUChar("oled_bright", oledBrightPct);
+    preferences.putBool("alerts_beep", alertsBeepEnabled);
     preferences.end();
 }
 
@@ -356,10 +366,13 @@ static void previewSettingsAdjust(int dir) {
         int v = (int)oledSleepMode + dir;
         while (v < 0) v += 4;
         oledSleepMode = (uint8_t)(v % 4);
-    } else {
+    } else if (settingsEditField == 1) {
         int b = (int)oledBrightPct + dir * 5;
         oledBrightPct = (uint8_t)constrain(b, 0, 100);
         applyOledBrightness();
+    } else {
+        // Row "Alerts": Left = OFF, Right = ON
+        alertsBeepEnabled = (dir > 0);
     }
     settingsDirty = true;
 }
@@ -767,6 +780,16 @@ bool sendMessage(String msg, bool viaRepeater = false, uint8_t destAddh = 0xFF, 
     return acked;
 }
 
+// Short beep pattern when a chat frame (MSG2 / legacy MSG) is received — not HELLO / ACK.
+static void buzzerAlertNewChatMessage() {
+    for (int i = 0; i < 3; i++) {
+        digitalWrite(BUZZER_ACTIVE, HIGH);
+        delay(45);
+        digitalWrite(BUZZER_ACTIVE, LOW);
+        delay(55);
+    }
+}
+
 // =============================================================================
 // Receive Messages
 // =============================================================================
@@ -778,6 +801,7 @@ void checkIncoming() {
     if (rc.status.code != 1) return;
 
     String payload = rc.data;
+    const String rxRaw = payload;
 
     // ACK frame format: ACK|<msgId>
     if (payload.startsWith("ACK|")) {
@@ -845,6 +869,13 @@ void checkIncoming() {
     lastReceived = payload;
     lastRssiSignal = (int8_t)rc.rssi;
     statusMsg = "RX OK";
+
+    if (rxRaw.startsWith("MSG2|") || rxRaw.startsWith("MSG|")) {
+        noteDisplayActivity();
+        if (alertsBeepEnabled) {
+            buzzerAlertNewChatMessage();
+        }
+    }
 
     // Learn nearby nodes via HELLO beacons:
     // Payload format: HELLO|AABB|NN|CC|R/N  or  HELLO|AABB|NN|CC|R/N|callSign
@@ -951,6 +982,8 @@ void handleRoot() {
     button.relay:hover{background:#d70;}
     button.restart{background:#f00;}
     button.restart:hover{background:#c00;}
+    button.gps{background:#2a9d8f;}
+    button.gps:hover{background:#21867a;}
     table{width:100%;border-collapse:collapse;margin-top:15px;}
     th,td{padding:10px;text-align:left;border-bottom:1px solid #333;}
     th{background:#0f3460;color:#0af;}
@@ -975,6 +1008,16 @@ void handleRoot() {
           document.getElementById('msgInput').value = '';
           refreshData();
         });
+    }
+
+    function sendGpsMsg(useRelay) {
+      let to = document.getElementById('nodeSelect') ? document.getElementById('nodeSelect').value : '';
+      let base = useRelay ? '/gps?relay=1' : '/gps?';
+      let url = base;
+      if (to && to !== 'default') url += (base.endsWith('?') ? '' : '&') + 'to=' + encodeURIComponent(to);
+      fetch(url)
+        .then(r => r.text())
+        .then(t => { alert(t.substring(0, 200)); refreshData(); });
     }
     
     function saveConfig() {
@@ -1190,6 +1233,13 @@ void handleRoot() {
         <button onclick="sendMsg(false)">📤 Send Direct</button>
         <button class="relay" onclick="sendMsg(true)">🔄 Send via Repeater</button>
       </div>
+      <p style="color:#aaa;font-size:14px;margin-top:14px;">GPS snapshot (LoRa text <code style="color:#0af">GPS,Stas,sats,lat,lng</code>):</p>
+      <div>
+        <button class="gps" onclick="sendGpsMsg(false)">📍 Send GPS (direct)</button>
+        <button class="gps" onclick="sendGpsMsg(true)">📍 Send GPS (repeater)</button>
+        <br>
+        <a href="/gps" class="gps style="color:#888;font-size:13px;margin-left:8px;" target="_blank" rel="noopener">GPS</a>
+      </div>
     </div>
     
     <div class="card">
@@ -1341,6 +1391,27 @@ void handleSetPowerSave() {
     ESP.restart();
 }
 
+static void parseOptionalSendDest(uint8_t &destAddh, uint8_t &destAddl, bool &overrideDest) {
+    overrideDest = false;
+    if (server.hasArg("to")) {
+        int16_t addr = parseHex16(server.arg("to"));
+        if (addr >= 0) {
+            destAddh = (uint8_t)((addr >> 8) & 0xFF);
+            destAddl = (uint8_t)(addr & 0xFF);
+            overrideDest = true;
+        }
+    }
+    if (server.hasArg("addh") && server.hasArg("addl")) {
+        int16_t ah = parseHex8(server.arg("addh"));
+        int16_t al = parseHex8(server.arg("addl"));
+        if (ah >= 0 && al >= 0) {
+            destAddh = (uint8_t)ah;
+            destAddl = (uint8_t)al;
+            overrideDest = true;
+        }
+    }
+}
+
 void handleSend() {
     if (server.hasArg("msg")) {
         String msg = server.arg("msg");
@@ -1353,27 +1424,7 @@ void handleSend() {
         bool overrideDest = false;
         uint8_t destAddh = 0;
         uint8_t destAddl = 0;
-
-        // Optional override target: /send?to=AABB
-        if (server.hasArg("to")) {
-            int16_t addr = parseHex16(server.arg("to"));
-            if (addr >= 0) {
-                destAddh = (uint8_t)((addr >> 8) & 0xFF);
-                destAddl = (uint8_t)(addr & 0xFF);
-                overrideDest = true;
-            }
-        }
-
-        // Optional override target: /send?addh=AA&addl=BB (takes priority)
-        if (server.hasArg("addh") && server.hasArg("addl")) {
-            int16_t ah = parseHex8(server.arg("addh"));
-            int16_t al = parseHex8(server.arg("addl"));
-            if (ah >= 0 && al >= 0) {
-                destAddh = (uint8_t)ah;
-                destAddl = (uint8_t)al;
-                overrideDest = true;
-            }
-        }
+        parseOptionalSendDest(destAddh, destAddl, overrideDest);
 
         bool acked = sendMessage(msg, useRelay, destAddh, destAddl, overrideDest);
         if (acked) {
@@ -1383,6 +1434,36 @@ void handleSend() {
         }
     } else {
         server.send(400, "text/plain", "Missing msg parameter");
+    }
+}
+
+// GET /gps — send one LoRa message with current GPS summary:
+//   GPS,Stas,<sats>,<lat>,<lng>   ("Stas" = stats / satellite count field)
+// Optional: same as /send — relay=1, to=AABB, addh=&addl=
+void handleGpsSend() {
+    while (gpsSerial.available() > 0) {
+        gps.encode(gpsSerial.read());
+    }
+
+    char buf[72];
+    unsigned long sats = (unsigned long)gps.satellites.value();
+    if (gps.location.isValid()) {
+        snprintf(buf, sizeof(buf), "GPS,Stas,%lu,%.6f,%.6f", sats, gps.location.lat(), gps.location.lng());
+    } else {
+        snprintf(buf, sizeof(buf), "GPS,Stas,%lu,0,0", sats);
+    }
+
+    bool useRelay = server.hasArg("relay");
+    bool overrideDest = false;
+    uint8_t destAddh = 0;
+    uint8_t destAddl = 0;
+    parseOptionalSendDest(destAddh, destAddl, overrideDest);
+
+    bool acked = sendMessage(String(buf), useRelay, destAddh, destAddl, overrideDest);
+    if (acked) {
+        server.send(200, "text/plain", String("OK (ACK) ") + buf);
+    } else {
+        server.send(504, "text/plain", String("Timeout waiting ACK — ") + buf);
     }
 }
 
@@ -1557,7 +1638,8 @@ void handleAPIStatus() {
     json += "\"channel\":\"" + toHex2(CHANNEL) + "\",";
     json += "\"crypt\":\"" + toHex4(CRYPT) + "\",";
     json += "\"useRepeater\":" + String(USE_REPEATER ? "true" : "false") + ",";
-    json += "\"txPower\":" + String(E22_TX_POWER);
+    json += "\"txPower\":" + String(E22_TX_POWER) + ",";
+    json += "\"alertsBeep\":" + String(alertsBeepEnabled ? "true" : "false");
     json += "},";
 
     // Traffic counters and last payloads.
@@ -1711,69 +1793,95 @@ void ClearConfig() {
 // ────────────────────────────────────────────────
 // Read battery from BAT_READER (ADC), charging from BAT_CHARGING
 // ────────────────────────────────────────────────
-float getBattV() {
-  // Low-pass filter (exponential moving average) to smooth voltage
-  static bool   battInit = false;
-  static float  battFilt = 0.0f;
+static float readBatteryVoltageInstant() {
+  uint32_t sum = 0;
+  for (int i = 0; i < BAT_ADC_SAMPLES; i++) {
+    sum += (uint32_t)analogRead(BAT_READER);
+    delayMicroseconds(200);
+  }
+  float rawAvg = (float)sum / (float)BAT_ADC_SAMPLES;
+  float adcPinV = rawAvg * BAT_ADC_VREF / BAT_ADC_MAX;
+  return adcPinV * BAT_DIVIDER_RATIO;
+}
 
-  int raw = analogRead(BAT_READER);
-  float adcVoltage = (float)raw * 3.30f / (float)BAT_ADC_MAX; // ADC pin voltage
-  float vInstant   = adcVoltage * 2.3f;                       // battery voltage (divider factor)
-
-  const float alpha = 0.20f;  // 0..1, higher = faster response, lower = smoother
+static float filterBatteryVoltage(float vInstant) {
+  static bool battInit = false;
+  static float battFilt = 0.0f;
+  const float alpha = 0.15f;
   if (!battInit) {
     battFilt = vInstant;
     battInit = true;
   } else {
-    battFilt = battFilt + alpha * (vInstant - battFilt);
+    battFilt += alpha * (vInstant - battFilt);
   }
-
-  // Debug
-  // Serial.print("BAT_READER raw: ");
-  // Serial.println(raw);
-  // Serial.print("BattV filtered: ");
-  // Serial.println(battFilt, 2);
-
   return battFilt;
 }
 
-int getBattPct() {
-  float v = getBattV();
-  float pct = (v - (float)BAT_V_MIN) * 100.0f / ((float)BAT_V_MAX - (float)BAT_V_MIN);
-  return constrain((int)(pct + 0.5f), 0, 100);
+static int batteryPercentFromVoltage(float v) {
+  if (v <= BAT_V_MIN) return BAT_PCT_MIN;
+  if (v >= BAT_V_MAX) return BAT_PCT_MAX;
+  float pct = (float)BAT_PCT_MIN +
+                (v - BAT_V_MIN) * (float)(BAT_PCT_MAX - BAT_PCT_MIN) / (BAT_V_MAX - BAT_V_MIN);
+  return (int)(pct + 0.5f);
 }
 
 void readBattery() {
-  batteryVoltage = getBattV();
-  batteryPercent = getBattPct();
+  float vInstant = readBatteryVoltageInstant();
+  batteryVoltage = filterBatteryVoltage(vInstant);
+  batteryPercent = batteryPercentFromVoltage(batteryVoltage);
 
-  static bool rawChargeState = false;
-  static bool debouncedChargeState = false;
-  static unsigned long lastRawChangeMs = 0;
+  static bool chargePinHigh = false;
+  static unsigned long chargeHighSince = 0;
+  static unsigned long chargeLowSince = 0;
+  static bool chargeDebounceInit = false;
+
+  if (!chargeDebounceInit) {
+    chargeDebounceInit = true;
+    chargeHighSince = millis();
+    chargeLowSince = millis();
+    chargePinHigh = (digitalRead(BAT_CHARGING) == HIGH);
+  }
 
   bool rawNow = (digitalRead(BAT_CHARGING) == HIGH);
   unsigned long now = millis();
+  bool wasCharging = batteryCharging;
 
-  if (rawNow != rawChargeState) {
-    rawChargeState = rawNow;
-    lastRawChangeMs = now;
+  if (rawNow) {
+    if (!chargePinHigh) {
+      chargePinHigh = true;
+      chargeHighSince = now;
+    }
+    if (!batteryCharging && (now - chargeHighSince) >= CHARGE_PIN_DEBOUNCE_MS) {
+      lastBatteryCharging = batteryCharging;
+      batteryCharging = true;
+    }
+  } else {
+    if (chargePinHigh) {
+      chargePinHigh = false;
+      chargeLowSince = now;
+    }
+    if (batteryCharging && (now - chargeLowSince) >= CHARGE_PIN_RELEASE_MS) {
+      lastBatteryCharging = batteryCharging;
+      batteryCharging = false;
+      chargeScreenUiReady = false;
+    }
   }
 
-  if ((now - lastRawChangeMs) >= CHARGE_PIN_DEBOUNCE_MS) {
-    debouncedChargeState = rawChargeState;
+  if (batteryCharging == wasCharging) {
+    return;
   }
 
-  lastBatteryCharging = batteryCharging;
-  batteryCharging = debouncedChargeState;
-
-  // Re-enable charging screen automatically on a new charging event.
-  if (batteryCharging && !lastBatteryCharging) {
+  if (batteryCharging) {
     chargeScreenSuppressed = false;
+    chargeScreenUiReady = false;
     if (oledDisplayOff) {
       oledHardwarePower(true);
       oledDisplayOff = false;
       applyOledBrightness();
     }
+    noteDisplayActivity();
+    drawCurrentScreen();
+  } else if (wasCharging) {
     noteDisplayActivity();
     drawCurrentScreen();
   }
@@ -2167,10 +2275,11 @@ void drawSettingsScreen() {
   const int mx = 8;
   const int cardW = SCREEN_WIDTH - 2 * mx;
   const int cardX = mx;
-  const int rowH = 11;
-  const int rowGap = 2;
-  const int row1Top = 27;
+  const int rowH = 10;
+  const int rowGap = 1;
+  const int row1Top = 25;
   const int row2Top = row1Top + rowH + rowGap;
+  const int row3Top = row2Top + rowH + rowGap;
 
   display.setTextSize(1);
 
@@ -2192,21 +2301,18 @@ void drawSettingsScreen() {
   drawSettingsRow(cardX, cardW, row2Top, rowH, settingsEditField == 1,
                   settingsAdjusting && settingsEditField == 1, F("Brightness"), pctStr);
 
+  const char *alertVal = alertsBeepEnabled ? "ON" : "OFF";
+  drawSettingsRow(cardX, cardW, row3Top, rowH, settingsEditField == 2,
+                  settingsAdjusting && settingsEditField == 2, F("Alerts"), alertVal);
+
   drawScreenPageDots();
   display.display();
 }
 
 // ────────────────────────────────────────────────
-// Screen 5: Charging screen
+// Screen 5: Charging screen (partial updates to avoid full-screen blink)
 // ────────────────────────────────────────────────
-void drawChargingScreen() {
-  display.clearDisplay();
-
-  display.setTextSize(1);
-  display.setTextColor(SSD1306_WHITE);
-
-  // One line: "Charging" + 0–3 animated dots, centered
-  unsigned ndots = (unsigned)(millis() / 280UL) % 4U;
+static void drawChargingTitle(unsigned ndots) {
   char titleLine[16];
   int n = snprintf(titleLine, sizeof(titleLine), "Charging");
   if (n < 0) n = 0;
@@ -2214,29 +2320,43 @@ void drawChargingScreen() {
     titleLine[n++] = '.';
   titleLine[n] = '\0';
 
-  {
-    int16_t tx, ty;
-    uint16_t tw, th;
-    display.getTextBounds(titleLine, 0, 0, &tx, &ty, &tw, &th);
-    display.setCursor((SCREEN_WIDTH - (int)tw) / 2, 17);
-    display.print(titleLine);
-  }
+  display.fillRect(0, 15, SCREEN_WIDTH, 12, SSD1306_BLACK);
+  display.setTextSize(1);
+  display.setTextColor(SSD1306_WHITE);
+  int16_t tx, ty;
+  uint16_t tw, th;
+  display.getTextBounds(titleLine, 0, 0, &tx, &ty, &tw, &th);
+  display.setCursor((SCREEN_WIDTH - (int)tw) / 2, 17);
+  display.print(titleLine);
+}
 
-  // Compact battery: small body + nub, animated fill inside
+static void drawChargingBatteryAnim(int inX, int inY, int inW, int inH, int fillW, int marchHx) {
+  display.fillRect(inX, inY, inW, inH, SSD1306_BLACK);
+  if (fillW > 0) {
+    display.fillRect(inX, inY, fillW, inH, SSD1306_WHITE);
+    if (fillW >= 4 && marchHx >= inX && marchHx < inX + fillW) {
+      display.drawFastVLine(marchHx, inY, inH, SSD1306_BLACK);
+    }
+  }
+}
+
+void drawChargingScreen(bool fullRedraw) {
+  static unsigned lastDots = 99;
+  static int lastFillW = -1;
+  static int lastMarchHx = -999;
+
   const int batX = 46;
   const int batY = 30;
   const int bodyW = 30;
   const int bodyH = 12;
-  display.drawRoundRect(batX, batY, bodyW, bodyH, 2, SSD1306_WHITE);
-  display.fillRect(batX + bodyW, batY + 4, 2, 4, SSD1306_WHITE);
-
   const int inX = batX + 2;
   const int inY = batY + 2;
   const int inW = bodyW - 4;
   const int inH = bodyH - 4;
 
-  // Smooth “breathing” level inside the cell (loops while plugged in)
-  const unsigned long breathMs = 1400UL;
+  const unsigned ndots = (unsigned)(millis() / 500UL) % 4U;
+
+  const unsigned long breathMs = 4400UL;
   unsigned long ph = millis() % breathMs;
   int fillW;
   if (ph < breathMs / 2)
@@ -2244,20 +2364,51 @@ void drawChargingScreen() {
   else
     fillW = (int)((unsigned long)inW * (breathMs - ph) / (breathMs / 2));
   fillW = constrain(fillW, 1, inW);
-  display.fillRect(inX, inY, fillW, inH, SSD1306_WHITE);
 
-  // Thin “shimmer” line moving across the filled area (visible on 1bpp OLEDs)
+  int marchHx = -1;
   if (fillW >= 4) {
     const int nSeg = 5;
     int segPx = max(1, fillW / nSeg);
-    int march = (int)((millis() / 100UL) % (unsigned long)(nSeg + 1));
-    int hx = constrain(inX + march * segPx, inX, inX + fillW - 2);
-    display.drawFastVLine(hx, inY, inH, SSD1306_BLACK);
+    int march = (int)((millis() / 450UL) % (unsigned long)(nSeg + 1));
+    marchHx = constrain(inX + march * segPx, inX, inX + fillW - 2);
   }
 
-  display.setCursor(4, 56);
-  display.print(F("RIGHT 3s: main"));
-  display.display();
+  bool needDisplay = false;
+
+  if (fullRedraw || !chargeScreenUiReady) {
+    display.clearDisplay();
+    // drawHeader();
+    // drawScreenDivider();
+    drawChargingTitle(ndots);
+    display.drawRoundRect(batX, batY, bodyW, bodyH, 2, SSD1306_WHITE);
+    display.fillRect(batX + bodyW, batY + 4, 2, 4, SSD1306_WHITE);
+    drawChargingBatteryAnim(inX, inY, inW, inH, fillW, marchHx);
+    display.setTextSize(1);
+    display.setTextColor(SSD1306_WHITE);
+    display.setCursor(4, 50);
+    display.print(F("Hold RIGHT 3s: Home"));
+    chargeScreenUiReady = true;
+    lastDots = ndots;
+    lastFillW = fillW;
+    lastMarchHx = marchHx;
+    needDisplay = true;
+  } else {
+    if (ndots != lastDots) {
+      drawChargingTitle(ndots);
+      lastDots = ndots;
+      needDisplay = true;
+    }
+    if (fillW != lastFillW || marchHx != lastMarchHx) {
+      drawChargingBatteryAnim(inX, inY, inW, inH, fillW, marchHx);
+      lastFillW = fillW;
+      lastMarchHx = marchHx;
+      needDisplay = true;
+    }
+  }
+
+  if (needDisplay) {
+    display.display();
+  }
 }
 
 // ────────────────────────────────────────────────
@@ -2274,15 +2425,18 @@ void drawCurrentScreen() {
     }
   }
   if (batteryCharging && !chargeScreenSuppressed) {
-    drawChargingScreen();
-  } else if (currentScreen == 0) {
-    drawStatusScreen();
-  } else if (currentScreen == 1) {
-    drawWifiScreen();
-  } else if (currentScreen == 2) {
-    drawGpsScreen();
+    drawChargingScreen(!chargeScreenUiReady);
   } else {
-    drawSettingsScreen();
+    chargeScreenUiReady = false;
+    if (currentScreen == 0) {
+      drawStatusScreen();
+    } else if (currentScreen == 1) {
+      drawWifiScreen();
+    } else if (currentScreen == 2) {
+      drawGpsScreen();
+    } else {
+      drawSettingsScreen();
+    }
   }
 }
 
@@ -2357,6 +2511,7 @@ void setup() {
     server.on("/setPower", HTTP_GET, handleSetPowerPage);
     server.on("/setPower/save", HTTP_POST, handleSetPowerSave);
     server.on("/send", handleSend);
+    server.on("/gps", handleGpsSend);
     server.on("/config", handleConfig);
     server.on("/status", handleStatusPage);
     server.on("/api/status", handleAPIStatus);
@@ -2372,8 +2527,8 @@ void setup() {
     // Initialize OLED
     Wire.begin(OLED_SDA, OLED_SCL);
     display.begin(SSD1306_SWITCHCAPVCC, SCREEN_ADDRESS);
-    // display.setRotation(2);
-    display.setRotation(0);
+    display.setRotation(2); // Old board
+    // display.setRotation(0);
     applyOledBrightness();
     noteDisplayActivity();
 
@@ -2407,6 +2562,8 @@ void setup() {
 
     pinMode(BAT_READER, INPUT);
     pinMode(BAT_CHARGING, INPUT);
+    analogReadResolution(12);
+    analogSetPinAttenuation(BAT_READER, ADC_11db);
     readBattery();
     // lastSyncBroadcastMs = millis();
     drawCurrentScreen();
@@ -2489,6 +2646,7 @@ void loop() {
       } else if (!rightBtnLongSent && (millis() - rightBtnDownMs >= BTN_RIGHT_LONG_PRESS_MS)) {
         rightBtnLongSent = true;
         chargeScreenSuppressed = true;
+        chargeScreenUiReady = false;
         currentScreen = 0;
         settingsAdjusting = false;
         popupType = PopupType::None;
@@ -2528,7 +2686,7 @@ void loop() {
         noteDisplayActivity();
         popupType = PopupType::None;
         settingsAdjusting = false;
-        settingsEditField = (uint8_t)((settingsEditField + 2 - 1) % 2);
+        settingsEditField = (uint8_t)((settingsEditField + 3 - 1) % 3);
         drawCurrentScreen();
       }
       upHeld = false;
@@ -2548,7 +2706,7 @@ void loop() {
         noteDisplayActivity();
         popupType = PopupType::None;
         settingsAdjusting = false;
-        settingsEditField = (uint8_t)((settingsEditField + 1) % 2);
+        settingsEditField = (uint8_t)((settingsEditField + 1) % 3);
         drawCurrentScreen();
       }
       downHeld = false;
@@ -2600,7 +2758,10 @@ void loop() {
   if (millis() - lastBatteryRead >= 2000UL) {
     lastBatteryRead = millis();
     readBattery();
-    if (popupType == PopupType::None) drawCurrentScreen();
+    // readBattery() redraws only on plug-in; avoid extra full clear while charging
+    if (popupType == PopupType::None && !(batteryCharging && !chargeScreenSuppressed)) {
+      drawCurrentScreen();
+    }
   }
 
   bool chargeScreenVisible = (batteryCharging && !chargeScreenSuppressed);
@@ -2610,3 +2771,4 @@ void loop() {
     drawCurrentScreen();
   }
 }
+
