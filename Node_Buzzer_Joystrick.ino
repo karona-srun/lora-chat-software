@@ -44,16 +44,14 @@ String defaultApSsid() {
 #define BAT_READER    35  // ADC pin for battery voltage  // 35 New ADC pin for battery voltage
 #define BAT_CHARGING  34  // HIGH when charging (input only)
 
-// Battery ADC: 12-bit, 0–3.3 V at pin (ADC_11db). Tune BAT_DIVIDER_RATIO to your divider.
+// Battery ADC. GPIO35 uses the battery divider in normal/unplugged mode.
+// Charging can lift the ADC-side voltage above the real 1-cell battery voltage,
+// so the converted value is capped at BAT_VOLTAGE_MAX before display/percentage.
+// If your board uses a different divider, tune only BAT_DIVIDER_RATIO.
 #define BAT_ADC_MAX        4095.0f
-#define BAT_ADC_VREF       3.30f    // ESP32 ADC reference at 11 dB attenuation
-#define BAT_DIVIDER_RATIO  (4.20f / 3.30f)  // Vbattery = Vadc_pin * ratio (4.2 V pack → ~3.3 V at pin)
-
-// Percent map: 3.6 V → 5%, 4.2 V → 100% (linear between)
-#define BAT_V_MIN          3.60f
-#define BAT_V_MAX          4.20f
-#define BAT_PCT_MIN        5
-#define BAT_PCT_MAX        100
+#define BAT_ADC_VREF_MV    3300.0f
+#define BAT_DIVIDER_RATIO  2.0f
+#define BAT_VOLTAGE_MAX    4.20f
 #define BAT_ADC_SAMPLES    16
 
 // Five-way control: Left/Right change screen; Up/Down adjust values in settings edit;
@@ -1519,7 +1517,7 @@ void handleStatusPage() {
     appendStatusRow(html, "Channel", "0x" + toHex2(CHANNEL));
     appendStatusRow(html, "CRYPT (hex)", "0x" + toHex4(CRYPT));
     appendStatusRow(html, "Use repeater (app)", USE_REPEATER ? "yes" : "no");
-    appendStatusRow(html, "Battery", String(batteryPercent));
+    appendStatusRow(html, "Battery", getBattery());
     appendStatusRow(html, "Charging", String(batteryCharging));
     html += F("</table>");
 
@@ -1629,6 +1627,7 @@ void handleAPIStatus() {
     json += "\"callSign\":\"" + String(ssid_AP) + "\",";
     json += "\"uptime\":\"" + jsonEscape(getUptime()) + "\",";
     json += "\"battery\":" + String(batteryPercent) + ",";
+    json += "\"batteryVoltage\":" + String(batteryVoltage, 2) + ",";
     json += "\"charging\":\"" + jsonEscape(getCharging()) + "\",";
     json += "\"ip\":\"" + jsonEscape(WiFi.softAPIP().toString()) + "\",";
     json += "\"myAddr\":\"" + toHex2(MY_ADDH) + toHex2(MY_ADDL) + "\",";
@@ -1794,14 +1793,20 @@ void ClearConfig() {
 // Read battery from BAT_READER (ADC), charging from BAT_CHARGING
 // ────────────────────────────────────────────────
 static float readBatteryVoltageInstant() {
-  uint32_t sum = 0;
+  uint32_t rawSum = 0;
+  uint32_t mvSum = 0;
   for (int i = 0; i < BAT_ADC_SAMPLES; i++) {
-    sum += (uint32_t)analogRead(BAT_READER);
+    rawSum += (uint32_t)analogRead(BAT_READER);
+    mvSum += (uint32_t)analogReadMilliVolts(BAT_READER);
     delayMicroseconds(200);
   }
-  float rawAvg = (float)sum / (float)BAT_ADC_SAMPLES;
-  float adcPinV = rawAvg * BAT_ADC_VREF / BAT_ADC_MAX;
-  return adcPinV * BAT_DIVIDER_RATIO;
+  float mvAvg = (float)mvSum / (float)BAT_ADC_SAMPLES;
+  if (mvAvg <= 0.0f) {
+    float rawAvg = (float)rawSum / (float)BAT_ADC_SAMPLES;
+    mvAvg = rawAvg * BAT_ADC_VREF_MV / BAT_ADC_MAX;
+  }
+  float adcPinV = mvAvg / 1000.0f;
+  return min(adcPinV * BAT_DIVIDER_RATIO, BAT_VOLTAGE_MAX);
 }
 
 static float filterBatteryVoltage(float vInstant) {
@@ -1818,11 +1823,41 @@ static float filterBatteryVoltage(float vInstant) {
 }
 
 static int batteryPercentFromVoltage(float v) {
-  if (v <= BAT_V_MIN) return BAT_PCT_MIN;
-  if (v >= BAT_V_MAX) return BAT_PCT_MAX;
-  float pct = (float)BAT_PCT_MIN +
-                (v - BAT_V_MIN) * (float)(BAT_PCT_MAX - BAT_PCT_MIN) / (BAT_V_MAX - BAT_V_MIN);
-  return (int)(pct + 0.5f);
+  struct BatteryPoint {
+    float voltage;
+    int percent;
+  };
+
+  static const BatteryPoint curve[] = {
+    {3.30f, 0},
+    {3.50f, 10},
+    {3.60f, 20},
+    {3.68f, 30},
+    {3.73f, 40},
+    {3.79f, 50},
+    {3.85f, 60},
+    {3.92f, 70},
+    {4.00f, 80},
+    {4.10f, 90},
+    {4.20f, 100},
+  };
+
+  const size_t pointCount = sizeof(curve) / sizeof(curve[0]);
+  if (v <= curve[0].voltage) return curve[0].percent;
+  if (v >= curve[pointCount - 1].voltage) return curve[pointCount - 1].percent;
+
+  for (size_t i = 1; i < pointCount; i++) {
+    if (v <= curve[i].voltage) {
+      const BatteryPoint &low = curve[i - 1];
+      const BatteryPoint &high = curve[i];
+      float pct = (float)low.percent +
+                  (v - low.voltage) * (float)(high.percent - low.percent) /
+                  (high.voltage - low.voltage);
+      return constrain((int)(pct + 0.5f), 0, 100);
+    }
+  }
+
+  return 0;
 }
 
 void readBattery() {
@@ -2771,4 +2806,3 @@ void loop() {
     drawCurrentScreen();
   }
 }
-

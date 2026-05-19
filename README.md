@@ -72,7 +72,7 @@ Values are overridden after first save in **`Preferences`** namespace `lora-conf
 
 | Function | GPIO | Notes |
 |----------|------|--------|
-| Battery voltage ADC | **35** | 16-sample average; scale via `BAT_DIVIDER_RATIO` (default 4.2/3.3). **3.6 V → 5%**, **4.2 V → 100%** |
+| Battery voltage ADC | **35** | 16-sample calibrated mV average; scale via `BAT_DIVIDER_RATIO` (default **2.0** for the normal battery divider). Voltage is capped at **4.20 V** during display/percentage so charging cannot show impossible 1-cell values |
 | Charging detect (input) | **34** | HIGH when charging |
 | Buzzer (active) | **15** | |
 | Button **Left** | **23** | Active **LOW**, internal pull-up |
