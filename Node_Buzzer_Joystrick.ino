@@ -18,7 +18,7 @@
 Preferences preferences;
 
 uint8_t MY_ADDH = 0x00;
-uint8_t MY_ADDL = 0x02;     // Default Node ID
+uint8_t MY_ADDL = 0x04;     // Default Node ID
 uint8_t TARGET_ADDH = 0x00;
 uint8_t TARGET_ADDL = 0x00; // Default Target
 uint8_t REPEATER_ADDH = 0xFF;
@@ -26,7 +26,7 @@ uint8_t REPEATER_ADDL = 0xFF;
 uint8_t NETWORK_ID = 0x01;  // Default Network ID
 uint8_t CHANNEL = 0x41;     // Default Channel 915Mhz
 uint16_t CRYPT = 0x8002;    // KEY 32770
-bool USE_REPEATER = true;  // Repeater mode
+bool USE_REPEATER = false;  // Repeater mode
 // E22 TX power: 0=POWER_22, 1=POWER_17, 2=POWER_13, 3=POWER_10 (see LoRa_E22 Option.transmissionPower)
 uint8_t E22_TX_POWER = 0;
 
@@ -2421,7 +2421,7 @@ void drawChargingScreen(bool fullRedraw) {
     display.setTextSize(1);
     display.setTextColor(SSD1306_WHITE);
     display.setCursor(4, 50);
-    display.print(F("Hold RIGHT 3s: Home"));
+    // display.print(F("Hold RIGHT 3s: Home"));
     chargeScreenUiReady = true;
     lastDots = ndots;
     lastFillW = fillW;
