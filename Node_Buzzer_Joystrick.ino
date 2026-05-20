@@ -117,7 +117,7 @@ const unsigned long CHARGE_PIN_DEBOUNCE_MS = 400UL;   // pin HIGH this long → 
 const unsigned long CHARGE_PIN_RELEASE_MS = 2500UL; // pin LOW this long → leave charging UI (stops flicker)
 const unsigned long UI_REFRESH_NORMAL_MS = 5000UL;
 // Charging animation tick (partial OLED updates — no full clear every frame)
-const unsigned long UI_REFRESH_CHARGING_MS = 450UL;
+const unsigned long UI_REFRESH_CHARGING_MS = 500UL;
 
 #define NUM_SCREENS 4
 
@@ -2562,8 +2562,8 @@ void setup() {
     // Initialize OLED
     Wire.begin(OLED_SDA, OLED_SCL);
     display.begin(SSD1306_SWITCHCAPVCC, SCREEN_ADDRESS);
-    display.setRotation(2); // Old board
-    // display.setRotation(0);
+    // display.setRotation(2); // Old board
+    display.setRotation(0);
     applyOledBrightness();
     noteDisplayActivity();
 
